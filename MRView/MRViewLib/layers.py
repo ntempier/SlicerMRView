@@ -5,10 +5,8 @@ and sh.py) and pushed to VTK in one go so updates stay interactive.
 """
 
 import itertools
-import os
 
 import numpy as np
-import qt
 import slicer
 import vtk
 
@@ -249,12 +247,11 @@ class TractLayer(object):
         self.max_display = value
         old_slabs = list(self.slab_models.values())
         self._build_working_set()
-        self.model3d.GetPolyData().SetPoints(self.vtk_points)
-        self.model3d.GetPolyData().GetPointData().Initialize()
+        # Swap in fresh meshes in one call: mutating a rendered mesh piece by piece
+        # lets VTK render cells/arrays that no longer match the points (segfault).
+        self.model3d.SetAndObservePolyData(self._new_polydata())
         for m in old_slabs:
-            pd = m.GetPolyData()
-            pd.SetPoints(self.vtk_points)
-            pd.GetPointData().Initialize()
+            m.SetAndObservePolyData(self._new_polydata())
         self.slab_signatures = {}
         self.apply_display()
         self.update_3d()
@@ -662,9 +659,8 @@ class FODLayer(object):
         if idx.size and tpl.n_verts * idx.size > MAX_GLYPH_VERTICES:
             idx = idx[:: int(np.ceil(idx.size * tpl.n_verts / MAX_GLYPH_VERTICES))]
 
-        pd = model.GetPolyData()
         if idx.size == 0:
-            self._set_empty(pd)
+            self._set_empty(model)
             self.glyph_counts[sid] = 0
             return
         amps = sh.amplitudes(self.coefs[idx], tpl)
@@ -673,7 +669,7 @@ class FODLayer(object):
         idx, amps, peak = idx[keep], amps[keep], peak[keep]
         self.glyph_counts[sid] = int(idx.size)
         if idx.size == 0:
-            self._set_empty(pd)
+            self._set_empty(model)
             return
         if self.normalize:
             r = amps / peak[:, None]
@@ -687,19 +683,22 @@ class FODLayer(object):
         else:
             rgb = mesh["rgb"]
         shaded = (rgb * mesh["shade"][:, None]).astype(np.uint8)
+        # Build a complete new mesh and swap it in with a single call. Editing the
+        # displayed mesh in place can trigger a render between SetPoints and
+        # SetNormals, where VTK reads arrays of the wrong length and crashes.
+        pd = vtk.vtkPolyData()
         pd.SetPoints(vtk_utils.vtk_points(mesh["points"]))
         pd.SetPolys(vtk_utils.triangle_cells(mesh["triangles"]))
-        pd.GetPointData().Initialize()
         pd.GetPointData().SetNormals(vtk_utils.data_array(mesh["normals"], "Normals"))
         pd.GetPointData().AddArray(vtk_utils.data_array(rgb, "RGB"))
         pd.GetPointData().AddArray(vtk_utils.data_array(shaded, "Shaded"))
-        pd.Modified()
+        model.SetAndObservePolyData(pd)
 
-    def _set_empty(self, pd):
+    def _set_empty(self, model):
+        pd = vtk.vtkPolyData()
         pd.SetPoints(vtk.vtkPoints())
         pd.SetPolys(vtk_utils.empty_cells())
-        pd.GetPointData().Initialize()
-        pd.Modified()
+        model.SetAndObservePolyData(pd)
 
     def info_text(self):
         s = self.shape
@@ -852,8 +851,9 @@ class ROIEntry(object):
         f.SetInputConnection(src.GetOutputPort())
         f.SetTransform(tf)
         f.Update()
-        self.sphere_model.GetPolyData().DeepCopy(f.GetOutput())
-        self.sphere_model.GetPolyData().Modified()
+        out = vtk.vtkPolyData()
+        out.DeepCopy(f.GetOutput())
+        self.sphere_model.SetAndObservePolyData(out)
 
     def set_visible(self, visible):
         dn = self.node.GetDisplayNode()
