@@ -1,0 +1,1525 @@
+import os
+import time
+
+import ctk
+import numpy as np
+import qt
+import slicer
+import vtk
+from slicer.ScriptedLoadableModule import (ScriptedLoadableModule, ScriptedLoadableModuleLogic,
+                                           ScriptedLoadableModuleTest, ScriptedLoadableModuleWidget)
+from slicer.util import VTKObservationMixin
+
+from MRViewLib import layers, mrtrix_io, tracts
+from MRViewLib.layers import COLOR_MODES, DETAIL_LEVELS, ROI_MODE_COLORS
+
+
+#
+# Module
+#
+
+class MRView(ScriptedLoadableModule):
+    def __init__(self, parent):
+        ScriptedLoadableModule.__init__(self, parent)
+        self.parent.title = "MRView"
+        self.parent.categories = ["Diffusion"]
+        self.parent.dependencies = []
+        self.parent.contributors = ["Nicolas Tempier"]
+        self.parent.helpText = """
+Visualisation de tractographies et de FOD façon <b>mrview</b> (MRtrix3) :
+<ul>
+<li>tractogrammes <code>.tck</code> en 3D et dans les coupes 2D (coupe épaisse « slab »)</li>
+<li>couleurs par direction, extrémités, couleur unie, aléatoire, longueur ou fichier <code>.tsf</code></li>
+<li>glyphes FOD (harmoniques sphériques <code>.mif</code>/<code>.nii</code>) dans les coupes 2D et en 3D</li>
+<li>filtrage des fibres en direct par ROI (boîte, sphère, masque ou segment) : inclure, exclure, extrémités</li>
+</ul>
+"""
+        self.parent.acknowledgementText = "Inspiré de mrview (MRtrix3, www.mrtrix.org)."
+
+
+#
+# Widget
+#
+
+STYLE = """
+QFrame#mrHeader {
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #16222a, stop:1 #3a6073);
+  border-radius: 8px;
+}
+QLabel#mrTitle { color: white; font-size: 17px; font-weight: 700; }
+QLabel#mrSubtitle { color: #d6e4ea; font-size: 11px; }
+QPushButton#mrPrimary {
+  background-color: #2f80ed; color: white; border: none; border-radius: 5px;
+  padding: 7px 12px; font-weight: 600;
+}
+QPushButton#mrPrimary:hover { background-color: #4b93f2; }
+QPushButton#mrPrimary:pressed { background-color: #1f6fd8; }
+QPushButton#mrPrimary:disabled { background-color: #8aa9d6; }
+QPushButton#mrSoft {
+  border: 1px solid #2f80ed; color: #2f80ed; border-radius: 5px; padding: 5px 10px; background: transparent;
+}
+QPushButton#mrSoft:hover { background-color: rgba(47,128,237,0.12); }
+QPushButton#mrInclude, QPushButton#mrExclude, QPushButton#mrEnds {
+  border-radius: 5px; padding: 6px 8px; font-weight: 600; color: white; border: none;
+}
+QPushButton#mrInclude { background-color: #27ae60; }
+QPushButton#mrInclude:hover { background-color: #2ecc71; }
+QPushButton#mrExclude { background-color: #e74c3c; }
+QPushButton#mrExclude:hover { background-color: #ef6a5c; }
+QPushButton#mrEnds { background-color: #e0a800; }
+QPushButton#mrEnds:hover { background-color: #f1c40f; }
+QProgressBar#mrRatio {
+  border: 1px solid rgba(128,128,128,0.6); border-radius: 5px; text-align: center; min-height: 18px;
+}
+QProgressBar#mrRatio::chunk { background-color: #27ae60; border-radius: 4px; }
+QLabel#mrHint { color: gray; font-size: 11px; }
+"""
+
+
+def _icon(name, fallback_text=None):
+    style = qt.QApplication.style()
+    sp = getattr(qt.QStyle, name, None)
+    if sp is None:
+        return None
+    return style.standardIcon(sp)
+
+
+def _button(text, object_name=None, tooltip=None, icon=None):
+    b = qt.QPushButton(text)
+    if object_name:
+        b.setObjectName(object_name)
+    if tooltip:
+        b.setToolTip(tooltip)
+    if icon is not None:
+        b.setIcon(icon)
+    b.setCursor(qt.QCursor(qt.Qt.PointingHandCursor))
+    return b
+
+
+def _slider(minimum, maximum, step, value, decimals=2, suffix=""):
+    s = ctk.ctkSliderWidget()
+    s.minimum = minimum
+    s.maximum = maximum
+    s.singleStep = step
+    s.pageStep = step * 10
+    s.decimals = decimals
+    s.value = value
+    if suffix:
+        s.suffix = suffix
+    return s
+
+
+def _hbox(*widgets, stretch_last=False):
+    w = qt.QWidget()
+    l = qt.QHBoxLayout(w)
+    l.setContentsMargins(0, 0, 0, 0)
+    l.setSpacing(6)
+    for x in widgets:
+        if x is None:
+            l.addStretch(1)
+        else:
+            l.addWidget(x)
+    return w
+
+
+def _qcolor(rgb):
+    return qt.QColor(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255))
+
+
+def _rgb(qcolor):
+    return (qcolor.redF(), qcolor.greenF(), qcolor.blueF())
+
+
+class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
+
+    def __init__(self, parent=None):
+        ScriptedLoadableModuleWidget.__init__(self, parent)
+        VTKObservationMixin.__init__(self)
+        self.logic = None
+        self._syncing = False
+
+    # ------------------------------------------------------------------ setup
+    def setup(self):
+        ScriptedLoadableModuleWidget.setup(self)
+        self.parent.setStyleSheet(STYLE)
+        self.logic = MRViewLogic()
+        self.logic.add_listener(self._on_logic_event)
+
+        self._build_header()
+        self._build_data_section()
+        self._build_tract_section()
+        self._build_fod_section()
+        self._build_roi_section()
+        self._build_help_section()
+        self.layout.addStretch(1)
+
+        self.refresh_tract_list()
+        self.refresh_fod_list()
+        self.refresh_roi_table()
+        self.refresh_filter_stats()
+
+    def cleanup(self):
+        self.removeObservers()
+        if self.logic is not None:
+            self.logic.cleanup()
+
+    # -- header -----------------------------------------------------------------
+    def _build_header(self):
+        frame = qt.QFrame()
+        frame.setObjectName("mrHeader")
+        l = qt.QVBoxLayout(frame)
+        l.setContentsMargins(14, 10, 14, 10)
+        l.setSpacing(2)
+        title = qt.QLabel("MRView pour Slicer")
+        title.setObjectName("mrTitle")
+        sub = qt.QLabel("Tractographie · FOD · filtrage ROI en direct")
+        sub.setObjectName("mrSubtitle")
+        l.addWidget(title)
+        l.addWidget(sub)
+        self.layout.addWidget(frame)
+
+    # -- data -------------------------------------------------------------------
+    def _build_data_section(self):
+        box = ctk.ctkCollapsibleButton()
+        box.text = "Données"
+        self.layout.addWidget(box)
+        v = qt.QVBoxLayout(box)
+
+        self.openButton = _button("  Ouvrir des fichiers…", "mrPrimary",
+                                  "Ouvre .tck, .tsf, .mif, .mif.gz, .nii, .nii.gz.\n"
+                                  "Le type (tractogramme, FOD, image) est détecté automatiquement.",
+                                  _icon("SP_DialogOpenButton"))
+        self.openButton.clicked.connect(self.on_open_files)
+        v.addWidget(self.openButton)
+
+        self.openTckButton = _button("Tractogramme", "mrSoft", "Ouvrir un ou plusieurs fichiers .tck")
+        self.openFodButton = _button("FOD", "mrSoft", "Ouvrir une image d'harmoniques sphériques (FOD)")
+        self.openImageButton = _button("Image", "mrSoft", "Ouvrir une image anatomique (T1, FA, …)")
+        self.openTckButton.clicked.connect(lambda: self.on_open_files("tck"))
+        self.openFodButton.clicked.connect(lambda: self.on_open_files("fod"))
+        self.openImageButton.clicked.connect(lambda: self.on_open_files("image"))
+        v.addWidget(_hbox(self.openTckButton, self.openFodButton, self.openImageButton))
+
+        layout_label = qt.QLabel("Disposition :")
+        buttons = []
+        for text, layout_id, tip in (
+                ("Classique", slicer.vtkMRMLLayoutNode.SlicerLayoutConventionalView, "3D en haut, 3 coupes en bas"),
+                ("4 vues", slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView, "3 coupes + 3D"),
+                ("3D", slicer.vtkMRMLLayoutNode.SlicerLayoutOneUp3DView, "Vue 3D seule"),
+                ("Axiale", slicer.vtkMRMLLayoutNode.SlicerLayoutOneUpRedSliceView, "Coupe axiale seule")):
+            b = qt.QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setAutoRaise(False)
+            b.clicked.connect(lambda checked=False, lid=layout_id: slicer.app.layoutManager().setLayout(lid))
+            buttons.append(b)
+        recenter = qt.QToolButton()
+        recenter.setText("Recentrer")
+        recenter.setToolTip("Recadrer les coupes et la vue 3D sur les données")
+        recenter.clicked.connect(self.logic.recenter_views)
+        v.addWidget(_hbox(layout_label, *buttons, None, recenter))
+
+    # -- tractography -----------------------------------------------------------
+    def _build_tract_section(self):
+        box = ctk.ctkCollapsibleButton()
+        box.text = "Tractographie"
+        self.layout.addWidget(box)
+        self.tractBox = box
+        v = qt.QVBoxLayout(box)
+
+        self.tractCombo = qt.QComboBox()
+        self.tractCombo.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+        self.tractVisible = qt.QCheckBox("Visible")
+        self.tractVisible.checked = True
+        self.tractRemove = qt.QToolButton()
+        trash = _icon("SP_TrashIcon")
+        if trash is not None:
+            self.tractRemove.setIcon(trash)
+        else:
+            self.tractRemove.setText("✕")
+        self.tractRemove.setToolTip("Fermer ce tractogramme")
+        v.addWidget(_hbox(self.tractCombo, self.tractVisible, self.tractRemove))
+
+        self.tractStats = qt.QLabel("Aucun tractogramme chargé.")
+        self.tractStats.setObjectName("mrHint")
+        self.tractStats.setWordWrap(True)
+        self.tractStats.setTextFormat(qt.Qt.RichText)
+        v.addWidget(self.tractStats)
+
+        self.tractForm = qt.QWidget()
+        form = qt.QFormLayout(self.tractForm)
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setFieldGrowthPolicy(qt.QFormLayout.AllNonFixedFieldsGrow)
+        v.addWidget(self.tractForm)
+
+        self.colorModeCombo = qt.QComboBox()
+        for key, label in COLOR_MODES:
+            self.colorModeCombo.addItem(label, key)
+        form.addRow("Couleur", self.colorModeCombo)
+
+        self.solidColorButton = ctk.ctkColorPickerButton()
+        self.solidColorButton.displayColorName = False
+        self.solidColorLabel = qt.QLabel("Couleur unie")
+        form.addRow(self.solidColorLabel, self.solidColorButton)
+
+        self.colormapCombo = slicer.qMRMLColorTableComboBox()
+        self.colormapCombo.setMRMLScene(slicer.mrmlScene)
+        self.colormapLabel = qt.QLabel("Palette")
+        form.addRow(self.colormapLabel, self.colormapCombo)
+
+        self.scalarRange = ctk.ctkRangeWidget()
+        self.scalarRange.decimals = 2
+        self.scalarRangeLabel = qt.QLabel("Plage")
+        form.addRow(self.scalarRangeLabel, self.scalarRange)
+
+        self.tsfButton = _button("Charger un fichier .tsf…", "mrSoft")
+        self.tsfLabel = qt.QLabel("Scalaires")
+        form.addRow(self.tsfLabel, self.tsfButton)
+
+        self.tractOpacity = _slider(0.0, 1.0, 0.05, 1.0)
+        form.addRow("Opacité", self.tractOpacity)
+        self.tractWidth = _slider(1.0, 8.0, 0.5, 2.0, 1, " px")
+        form.addRow("Épaisseur", self.tractWidth)
+        self.tractStyle = qt.QComboBox()
+        self.tractStyle.addItem("Lignes")
+        self.tractStyle.addItem("Tubes (GPU)")
+        self.tractStyle.setToolTip("Tubes : rendu ombré des lignes calculé par la carte graphique, sans coût de géométrie.")
+        form.addRow("Rendu 3D", self.tractStyle)
+
+        self.tractShow3D = qt.QCheckBox("Vue 3D")
+        self.tractShow2D = qt.QCheckBox("Coupes 2D")
+        self.tractShow3D.checked = True
+        self.tractShow2D.checked = True
+        form.addRow("Afficher dans", _hbox(self.tractShow3D, self.tractShow2D, None))
+
+        self.slabSlider = _slider(0.5, 40.0, 0.5, 5.0, 1, " mm")
+        self.slabSlider.setToolTip("Épaisseur de la tranche autour de chaque coupe 2D (équivalent du « crop to slab » de mrview).")
+        form.addRow("Tranche 2D", self.slabSlider)
+
+        self.maxDisplaySpin = qt.QSpinBox()
+        self.maxDisplaySpin.setRange(1000, 20000000)
+        self.maxDisplaySpin.setSingleStep(10000)
+        self.maxDisplaySpin.setValue(150000)
+        self.maxDisplaySpin.keyboardTracking = False
+        self.maxDisplaySpin.setGroupSeparatorShown(True)
+        self.maxDisplaySpin.setToolTip("Nombre maximum de fibres affichées et filtrées en direct.\n"
+                                       "L'export .tck utilise toujours le tractogramme complet.")
+        form.addRow("Fibres affichées (max)", self.maxDisplaySpin)
+
+        self.tractCombo.currentIndexChanged.connect(self.on_tract_selected)
+        self.tractVisible.toggled.connect(lambda on: self._set_tract("visible", on))
+        self.tractRemove.clicked.connect(self.on_remove_tract)
+        self.colorModeCombo.currentIndexChanged.connect(self.on_color_mode)
+        self.solidColorButton.connect("colorChanged(QColor)", lambda c: self._set_tract("solid_color", _rgb(c)))
+        self.colormapCombo.connect("currentNodeChanged(vtkMRMLNode*)", self.on_colormap)
+        self.scalarRange.connect("valuesChanged(double,double)", lambda a, b: self._set_tract("scalar_range", (a, b)))
+        self.tsfButton.clicked.connect(self.on_load_tsf)
+        self.tractOpacity.connect("valueChanged(double)", lambda x: self._set_tract("opacity", x))
+        self.tractWidth.connect("valueChanged(double)", lambda x: self._set_tract("line_width", x))
+        self.tractStyle.currentIndexChanged.connect(lambda i: self._set_tract("tubes", i == 1))
+        self.tractShow3D.toggled.connect(lambda on: self._set_tract("show3d", on))
+        self.tractShow2D.toggled.connect(lambda on: self._set_tract("show2d", on))
+        self.slabSlider.connect("valueChanged(double)", lambda x: self._set_tract("slab_mm", x))
+        self.maxDisplaySpin.valueChanged.connect(self.on_max_display)
+
+        default_cmap = slicer.mrmlScene.GetNodeByID("vtkMRMLColorTableNodeFileViridis.txt")
+        if default_cmap is not None:
+            self.colormapCombo.setCurrentNode(default_cmap)
+
+    # -- FOD --------------------------------------------------------------------
+    def _build_fod_section(self):
+        box = ctk.ctkCollapsibleButton()
+        box.text = "ODF / FOD"
+        self.layout.addWidget(box)
+        v = qt.QVBoxLayout(box)
+
+        self.fodCombo = qt.QComboBox()
+        self.fodCombo.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+        self.fodVisible = qt.QCheckBox("Visible")
+        self.fodVisible.checked = True
+        self.fodRemove = qt.QToolButton()
+        trash = _icon("SP_TrashIcon")
+        if trash is not None:
+            self.fodRemove.setIcon(trash)
+        else:
+            self.fodRemove.setText("✕")
+        self.fodRemove.setToolTip("Fermer cette image FOD")
+        v.addWidget(_hbox(self.fodCombo, self.fodVisible, self.fodRemove))
+
+        self.fodInfo = qt.QLabel("Aucune image FOD chargée.")
+        self.fodInfo.setObjectName("mrHint")
+        self.fodInfo.setWordWrap(True)
+        v.addWidget(self.fodInfo)
+
+        self.fodForm = qt.QWidget()
+        form = qt.QFormLayout(self.fodForm)
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setFieldGrowthPolicy(qt.QFormLayout.AllNonFixedFieldsGrow)
+        v.addWidget(self.fodForm)
+
+        self.fodShow2D = qt.QCheckBox("Coupes 2D")
+        self.fodShow3D = qt.QCheckBox("Vue 3D")
+        self.fodShow2D.checked = True
+        self.fodShow3D.setToolTip("Affiche en 3D les glyphes des coupes visibles")
+        form.addRow("Afficher dans", _hbox(self.fodShow2D, self.fodShow3D, None))
+
+        self.fodScale = _slider(0.1, 5.0, 0.05, 1.0)
+        form.addRow("Taille", self.fodScale)
+        self.fodThreshold = _slider(0.0, 1.0, 0.01, 0.1)
+        self.fodThreshold.setToolTip("Masque les glyphes dont l'amplitude maximale est inférieure à cette fraction "
+                                     "de l'amplitude de référence (95e percentile).")
+        form.addRow("Seuil d'amplitude", self.fodThreshold)
+        self.fodDetail = qt.QComboBox()
+        for level, label in DETAIL_LEVELS:
+            self.fodDetail.addItem(label, level)
+        self.fodDetail.setCurrentIndex(1)
+        form.addRow("Détail", self.fodDetail)
+        self.fodNormalize = qt.QCheckBox("Normaliser chaque glyphe")
+        form.addRow("", self.fodNormalize)
+        self.fodColorMode = qt.QComboBox()
+        self.fodColorMode.addItem("Direction", "direction")
+        self.fodColorMode.addItem("Couleur unie", "solid")
+        self.fodColor = ctk.ctkColorPickerButton()
+        self.fodColor.displayColorName = False
+        self.fodColor.color = _qcolor((0.85, 0.85, 0.85))
+        form.addRow("Couleur", _hbox(self.fodColorMode, self.fodColor))
+        self.fodOpacity = _slider(0.0, 1.0, 0.05, 1.0)
+        form.addRow("Opacité", self.fodOpacity)
+
+        self.alignButton = _button("Aligner les coupes sur la grille", "mrSoft",
+                                   "Oriente les coupes 2D selon les axes de l'image FOD (utile si l'acquisition est oblique)")
+        self.l0Button = _button("Image l=0 en fond", "mrSoft", "Utilise le terme l=0 des FOD comme image de fond")
+        v.addWidget(_hbox(self.alignButton, self.l0Button))
+
+        self.fodCount = qt.QLabel("")
+        self.fodCount.setObjectName("mrHint")
+        v.addWidget(self.fodCount)
+
+        self.fodCombo.currentIndexChanged.connect(self.on_fod_selected)
+        self.fodVisible.toggled.connect(lambda on: self._set_fod("visible", on))
+        self.fodRemove.clicked.connect(self.on_remove_fod)
+        self.fodShow2D.toggled.connect(lambda on: self._set_fod("show2d", on))
+        self.fodShow3D.toggled.connect(lambda on: self._set_fod("show3d", on))
+        self.fodScale.connect("valueChanged(double)", lambda x: self._set_fod("scale", x))
+        self.fodThreshold.connect("valueChanged(double)", lambda x: self._set_fod("threshold", x))
+        self.fodDetail.currentIndexChanged.connect(lambda i: self._set_fod("level", self.fodDetail.itemData(i)))
+        self.fodNormalize.toggled.connect(lambda on: self._set_fod("normalize", on))
+        self.fodColorMode.currentIndexChanged.connect(lambda i: self._set_fod("color_mode", self.fodColorMode.itemData(i)))
+        self.fodColor.connect("colorChanged(QColor)", lambda c: self._set_fod("solid_color", _rgb(c)))
+        self.fodOpacity.connect("valueChanged(double)", lambda x: self._set_fod("opacity", x))
+        self.alignButton.clicked.connect(self.on_align_to_fod)
+        self.l0Button.clicked.connect(self.on_l0_background)
+
+    # -- ROI --------------------------------------------------------------------
+    def _build_roi_section(self):
+        box = ctk.ctkCollapsibleButton()
+        box.text = "Filtrage par ROI (en direct)"
+        self.layout.addWidget(box)
+        v = qt.QVBoxLayout(box)
+
+        hint = qt.QLabel("Ajoute une ROI puis déplace-la ou redimensionne-la avec ses poignées "
+                         "dans les vues : les fibres se mettent à jour en direct.")
+        hint.setObjectName("mrHint")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        self.addBoxInclude = _button("+ Boîte", "mrInclude", "Nouvelle ROI boîte (inclure)")
+        self.addSphereInclude = _button("+ Sphère", "mrInclude", "Nouvelle ROI sphère (inclure)")
+        self.addBoxExclude = _button("+ Boîte", "mrExclude", "Nouvelle ROI boîte (exclure)")
+        self.addSphereExclude = _button("+ Sphère", "mrExclude", "Nouvelle ROI sphère (exclure)")
+        incl_label = qt.QLabel("Inclure")
+        excl_label = qt.QLabel("Exclure")
+        grid = qt.QGridLayout()
+        grid.addWidget(incl_label, 0, 0)
+        grid.addWidget(self.addBoxInclude, 0, 1)
+        grid.addWidget(self.addSphereInclude, 0, 2)
+        grid.addWidget(excl_label, 1, 0)
+        grid.addWidget(self.addBoxExclude, 1, 1)
+        grid.addWidget(self.addSphereExclude, 1, 2)
+        v.addLayout(grid)
+        self.addBoxInclude.clicked.connect(lambda: self.logic.add_roi("box", "include"))
+        self.addSphereInclude.clicked.connect(lambda: self.logic.add_roi("sphere", "include"))
+        self.addBoxExclude.clicked.connect(lambda: self.logic.add_roi("box", "exclude"))
+        self.addSphereExclude.clicked.connect(lambda: self.logic.add_roi("sphere", "exclude"))
+
+        self.maskSelector = slicer.qMRMLNodeComboBox()
+        self.maskSelector.nodeTypes = ["vtkMRMLSegmentationNode", "vtkMRMLLabelMapVolumeNode", "vtkMRMLScalarVolumeNode"]
+        self.maskSelector.noneEnabled = True
+        self.maskSelector.addEnabled = False
+        self.maskSelector.removeEnabled = False
+        self.maskSelector.showChildNodeTypes = True
+        self.maskSelector.setMRMLScene(slicer.mrmlScene)
+        self.maskSelector.setToolTip("Segmentation (un ROI par segment), labelmap ou volume binaire")
+        self.addMaskButton = _button("+ Masque", "mrSoft", "Ajouter ce masque / ces segments comme ROI")
+        self.addMaskButton.clicked.connect(self.on_add_mask)
+        v.addWidget(_hbox(self.maskSelector, self.addMaskButton))
+
+        self.roiTable = qt.QTableWidget()
+        self.roiTable.setColumnCount(5)
+        self.roiTable.setHorizontalHeaderLabels(["", "Nom", "Rôle", "Actif", ""])
+        self.roiTable.verticalHeader().setVisible(False)
+        self.roiTable.setSelectionMode(qt.QAbstractItemView.SingleSelection)
+        self.roiTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
+        hh = self.roiTable.horizontalHeader()
+        hh.setSectionResizeMode(0, qt.QHeaderView.Fixed)
+        hh.setSectionResizeMode(1, qt.QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, qt.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, qt.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, qt.QHeaderView.ResizeToContents)
+        self.roiTable.setColumnWidth(0, 14)
+        self.roiTable.setMinimumHeight(130)
+        self.roiTable.cellDoubleClicked.connect(lambda r, c: self.logic.jump_to_roi(r))
+        self.roiTable.itemChanged.connect(self.on_roi_item_changed)
+        v.addWidget(self.roiTable)
+
+        self.includeAll = qt.QRadioButton("toutes (ET)")
+        self.includeAny = qt.QRadioButton("au moins une (OU)")
+        self.includeAll.checked = True
+        self.includeAll.toggled.connect(lambda on: self.logic.set_include_mode("all" if on else "any"))
+        v.addWidget(_hbox(qt.QLabel("Inclusions requises :"), self.includeAll, self.includeAny, None))
+
+        self.liveCheck = qt.QCheckBox("Filtrage en direct")
+        self.liveCheck.checked = True
+        self.applyButton = _button("Appliquer", "mrSoft")
+        self.applyButton.enabled = False
+        self.showRois = qt.QCheckBox("Afficher les ROI")
+        self.showRois.checked = True
+        self.liveCheck.toggled.connect(self.on_live_toggled)
+        self.applyButton.clicked.connect(self.logic.apply_filters)
+        self.showRois.toggled.connect(self.logic.set_rois_visible)
+        v.addWidget(_hbox(self.liveCheck, self.applyButton, None, self.showRois))
+
+        self.ratioBar = qt.QProgressBar()
+        self.ratioBar.setObjectName("mrRatio")
+        self.ratioBar.setRange(0, 1000)
+        self.ratioBar.setValue(1000)
+        self.ratioBar.setFormat("—")
+        v.addWidget(self.ratioBar)
+        self.filterStats = qt.QLabel("")
+        self.filterStats.setObjectName("mrHint")
+        self.filterStats.setWordWrap(True)
+        self.filterStats.setTextFormat(qt.Qt.RichText)
+        v.addWidget(self.filterStats)
+
+        self.exportButton = _button("Enregistrer la sélection (.tck)…", "mrPrimary",
+                                    "Applique les ROI au tractogramme complet et enregistre le résultat",
+                                    _icon("SP_DialogSaveButton"))
+        self.toLayerButton = _button("Nouveau tractogramme", "mrSoft",
+                                     "Crée un nouveau tractogramme à partir des fibres sélectionnées")
+        self.clearRoisButton = _button("Supprimer les ROI", "mrSoft")
+        self.exportButton.clicked.connect(self.on_export_selection)
+        self.toLayerButton.clicked.connect(self.on_selection_to_layer)
+        self.clearRoisButton.clicked.connect(self.on_clear_rois)
+        v.addWidget(self.exportButton)
+        v.addWidget(_hbox(self.toLayerButton, self.clearRoisButton))
+
+    def _build_help_section(self):
+        box = ctk.ctkCollapsibleButton()
+        box.text = "Astuces"
+        box.collapsed = True
+        self.layout.addWidget(box)
+        v = qt.QVBoxLayout(box)
+        tips = qt.QLabel(
+            "<ul style='margin-left:-20px'>"
+            "<li><b>Défilement des coupes</b> : molette ou flèches ↑/↓ dans une vue 2D.</li>"
+            "<li><b>Déplacer le curseur 3D</b> : Maj + déplacement de la souris.</li>"
+            "<li><b>ROI</b> : double-clic sur une ligne du tableau pour centrer les coupes dessus.</li>"
+            "<li><b>Gros tractogrammes</b> : réduis « Fibres affichées (max) » pour garder un filtrage fluide ; "
+            "l'export utilise toujours toutes les fibres.</li>"
+            "<li><b>Extrémités</b> : la fibre doit commencer ou finir dans la ROI (connectivité).</li>"
+            "<li><b>Tubes (GPU)</b> donne un rendu ombré sans ralentir l'affichage.</li>"
+            "</ul>")
+        tips.setWordWrap(True)
+        tips.setTextFormat(qt.Qt.RichText)
+        v.addWidget(tips)
+
+    # ------------------------------------------------------------ data actions
+    def on_open_files(self, kind=None):
+        filters = {
+            None: "Fichiers MRtrix / NIfTI (*.tck *.tsf *.mif *.mif.gz *.mih *.nii *.nii.gz);;Tous (*)",
+            "tck": "Tractogrammes (*.tck);;Tous (*)",
+            "fod": "Images FOD (*.mif *.mif.gz *.mih *.nii *.nii.gz);;Tous (*)",
+            "image": "Images (*.mif *.mif.gz *.mih *.nii *.nii.gz *.nrrd);;Tous (*)",
+        }
+        start = self._last_dir()
+        paths = qt.QFileDialog.getOpenFileNames(slicer.util.mainWindow(), "Ouvrir", start, filters[kind])
+        if not paths:
+            return
+        self._remember_dir(paths[0])
+        # load images first so tractograms appear on top of a sensible background
+        def order(p):
+            low = p.lower()
+            return 2 if low.endswith(".tck") else (3 if low.endswith(".tsf") else 1)
+        for path in sorted(paths, key=order):
+            self._load_one(path, kind)
+
+    def _load_one(self, path, kind=None):
+        low = path.lower()
+        if kind is None:
+            if low.endswith(".tck"):
+                kind = "tck"
+            elif low.endswith(".tsf"):
+                kind = "tsf"
+            elif mrtrix_io.looks_like_fod(path):
+                kind = "fod"
+            else:
+                kind = "image"
+        name = os.path.basename(path)
+        try:
+            with slicer.util.tryWithErrorDisplay("Impossible d'ouvrir %s" % name, waitCursor=True):
+                slicer.util.showStatusMessage("Chargement de %s…" % name)
+                slicer.app.processEvents()
+                t0 = time.time()
+                if kind == "tck":
+                    self.logic.load_tractogram(path)
+                elif kind == "tsf":
+                    layer = self.current_tract()
+                    if layer is None:
+                        raise ValueError("Charge d'abord un tractogramme avant son fichier .tsf.")
+                    self.logic.load_tsf(layer, path)
+                    self._select_color_mode("tsf")
+                elif kind == "fod":
+                    self.logic.load_fod(path)
+                else:
+                    self.logic.load_image(path)
+                slicer.util.showStatusMessage("%s chargé en %.1f s" % (name, time.time() - t0), 4000)
+        except Exception:
+            pass
+
+    def _last_dir(self):
+        return qt.QSettings().value("MRView/lastDir", "") or ""
+
+    def _remember_dir(self, path):
+        qt.QSettings().setValue("MRView/lastDir", os.path.dirname(path))
+
+    # ---------------------------------------------------------- tract actions
+    def current_tract(self):
+        i = self.tractCombo.currentIndex
+        if 0 <= i < len(self.logic.tract_layers):
+            return self.logic.tract_layers[i]
+        return None
+
+    def refresh_tract_list(self, select=None):
+        self._syncing = True
+        try:
+            current = select if select is not None else self.current_tract()
+            self.tractCombo.clear()
+            for layer in self.logic.tract_layers:
+                self.tractCombo.addItem(layer.name)
+            if current in self.logic.tract_layers:
+                self.tractCombo.setCurrentIndex(self.logic.tract_layers.index(current))
+            elif self.logic.tract_layers:
+                self.tractCombo.setCurrentIndex(len(self.logic.tract_layers) - 1)
+        finally:
+            self._syncing = False
+        self.sync_tract_controls()
+
+    def sync_tract_controls(self):
+        layer = self.current_tract()
+        has = layer is not None
+        self.tractForm.enabled = has
+        self.tractVisible.enabled = has
+        self.tractRemove.enabled = has
+        if not has:
+            self.tractStats.text = "Aucun tractogramme chargé. Utilise « Ouvrir des fichiers… »."
+            self._update_color_rows("direction")
+            return
+        self._syncing = True
+        try:
+            self.tractStats.text = layer.stats_text()
+            self.tractVisible.checked = layer.visible
+            self.colorModeCombo.setCurrentIndex([k for k, _ in COLOR_MODES].index(layer.color_mode))
+            self.solidColorButton.color = _qcolor(layer.solid_color)
+            if layer.colormap_id:
+                self.colormapCombo.setCurrentNodeID(layer.colormap_id)
+            self.tractOpacity.value = layer.opacity
+            self.tractWidth.value = layer.line_width
+            self.tractStyle.setCurrentIndex(1 if layer.tubes else 0)
+            self.tractShow3D.checked = layer.show3d
+            self.tractShow2D.checked = layer.show2d
+            self.slabSlider.value = layer.slab_mm
+            self.maxDisplaySpin.setValue(layer.max_display)
+            self._sync_scalar_range(layer)
+            self._update_color_rows(layer.color_mode)
+        finally:
+            self._syncing = False
+
+    def _sync_scalar_range(self, layer):
+        if layer.color_mode not in ("length", "tsf"):
+            return
+        values = layer.scalar_values(layer.color_mode)
+        if values is None or values.size == 0:
+            return
+        lo, hi = float(values.min()), float(values.max())
+        if hi <= lo:
+            hi = lo + 1.0
+        if layer.scalar_range is None:
+            layer.scalar_range = layer.default_scalar_range(layer.color_mode)
+        self.scalarRange.setRange(lo, hi)
+        self.scalarRange.singleStep = max((hi - lo) / 200.0, 1e-4)
+        self.scalarRange.setValues(layer.scalar_range[0], layer.scalar_range[1])
+
+    def _update_color_rows(self, mode):
+        solid = mode == "solid"
+        scalar = mode in ("length", "tsf")
+        for w in (self.solidColorButton, self.solidColorLabel):
+            w.setVisible(solid)
+        for w in (self.colormapCombo, self.colormapLabel, self.scalarRange, self.scalarRangeLabel):
+            w.setVisible(scalar)
+        for w in (self.tsfButton, self.tsfLabel):
+            w.setVisible(mode == "tsf")
+
+    def on_tract_selected(self, index):
+        if not self._syncing:
+            self.sync_tract_controls()
+            self.refresh_filter_stats()
+
+    def _set_tract(self, attr, value):
+        if self._syncing:
+            return
+        layer = self.current_tract()
+        if layer is None:
+            return
+        setattr(layer, attr, value)
+        if attr == "slab_mm":
+            layer.invalidate_slabs()
+            self.logic.request_views()
+        elif attr in ("visible", "show2d"):
+            layer.apply_display()
+            layer.invalidate_slabs()
+            self.logic.request_views()
+        else:
+            layer.apply_display()
+
+    def _select_color_mode(self, mode):
+        keys = [k for k, _ in COLOR_MODES]
+        self.colorModeCombo.setCurrentIndex(keys.index(mode))
+
+    def on_color_mode(self, index):
+        mode = self.colorModeCombo.itemData(index)
+        self._update_color_rows(mode)
+        if self._syncing:
+            return
+        layer = self.current_tract()
+        if layer is None:
+            return
+        if mode == "tsf" and layer.full_tsf is None:
+            self.on_load_tsf()
+            if layer.full_tsf is None:
+                self._syncing = True
+                self.colorModeCombo.setCurrentIndex([k for k, _ in COLOR_MODES].index(layer.color_mode))
+                self._syncing = False
+                self._update_color_rows(layer.color_mode)
+                return
+        if mode != layer.color_mode:
+            layer.scalar_range = None
+        layer.color_mode = mode
+        if mode in ("length", "tsf") and not layer.colormap_id:
+            layer.colormap_id = self.colormapCombo.currentNodeID
+        with _WaitCursor():
+            layer.apply_display()
+        self._syncing = True
+        self._sync_scalar_range(layer)
+        self._syncing = False
+
+    def on_colormap(self, node):
+        if self._syncing:
+            return
+        layer = self.current_tract()
+        if layer is not None and node is not None:
+            layer.colormap_id = node.GetID()
+            layer.apply_display()
+
+    def on_load_tsf(self):
+        layer = self.current_tract()
+        if layer is None:
+            return
+        path = qt.QFileDialog.getOpenFileName(slicer.util.mainWindow(), "Fichier de scalaires", self._last_dir(),
+                                              "Track scalar files (*.tsf);;Tous (*)")
+        if not path:
+            return
+        self._remember_dir(path)
+        with slicer.util.tryWithErrorDisplay("Impossible de charger le fichier .tsf", waitCursor=True):
+            self.logic.load_tsf(layer, path)
+            self._select_color_mode("tsf")
+            layer.color_mode = "tsf"
+            if not layer.colormap_id:
+                layer.colormap_id = self.colormapCombo.currentNodeID
+            layer.apply_display()
+            self.sync_tract_controls()
+
+    def on_max_display(self, value):
+        if self._syncing:
+            return
+        layer = self.current_tract()
+        if layer is None:
+            return
+        with _WaitCursor():
+            self.logic.set_max_display(layer, int(value))
+        self.sync_tract_controls()
+
+    def on_remove_tract(self):
+        layer = self.current_tract()
+        if layer is not None:
+            self.logic.remove_tract(layer)
+
+    # ------------------------------------------------------------ FOD actions
+    def current_fod(self):
+        i = self.fodCombo.currentIndex
+        if 0 <= i < len(self.logic.fod_layers):
+            return self.logic.fod_layers[i]
+        return None
+
+    def refresh_fod_list(self, select=None):
+        self._syncing = True
+        try:
+            current = select if select is not None else self.current_fod()
+            self.fodCombo.clear()
+            for layer in self.logic.fod_layers:
+                self.fodCombo.addItem(layer.name)
+            if current in self.logic.fod_layers:
+                self.fodCombo.setCurrentIndex(self.logic.fod_layers.index(current))
+            elif self.logic.fod_layers:
+                self.fodCombo.setCurrentIndex(len(self.logic.fod_layers) - 1)
+        finally:
+            self._syncing = False
+        self.sync_fod_controls()
+
+    def sync_fod_controls(self):
+        layer = self.current_fod()
+        has = layer is not None
+        for w in (self.fodForm, self.fodVisible, self.fodRemove, self.alignButton, self.l0Button):
+            w.enabled = has
+        if not has:
+            self.fodInfo.text = "Aucune image FOD chargée."
+            self.fodCount.text = ""
+            return
+        self._syncing = True
+        try:
+            self.fodInfo.text = layer.info_text()
+            self.fodVisible.checked = layer.visible
+            self.fodShow2D.checked = layer.show2d
+            self.fodShow3D.checked = layer.show3d
+            self.fodScale.value = layer.scale
+            self.fodThreshold.value = layer.threshold
+            self.fodDetail.setCurrentIndex([l for l, _ in DETAIL_LEVELS].index(layer.level))
+            self.fodNormalize.checked = layer.normalize
+            self.fodColorMode.setCurrentIndex(0 if layer.color_mode == "direction" else 1)
+            self.fodColor.color = _qcolor(layer.solid_color)
+            self.fodOpacity.value = layer.opacity
+        finally:
+            self._syncing = False
+        self.refresh_fod_count()
+
+    def refresh_fod_count(self):
+        layer = self.current_fod()
+        if layer is None:
+            self.fodCount.text = ""
+            return
+        total = sum(layer.glyph_counts.values())
+        self.fodCount.text = "%s glyphes affichés" % layers._fmt_int(total)
+
+    def on_fod_selected(self, index):
+        if not self._syncing:
+            self.sync_fod_controls()
+
+    def _set_fod(self, attr, value):
+        if self._syncing:
+            return
+        layer = self.current_fod()
+        if layer is None:
+            return
+        setattr(layer, attr, value)
+        layer.apply_display()
+        if attr not in ("opacity",):
+            layer.invalidate()
+            self.logic.request_views()
+
+    def on_remove_fod(self):
+        layer = self.current_fod()
+        if layer is not None:
+            self.logic.remove_fod(layer)
+
+    def on_align_to_fod(self):
+        layer = self.current_fod()
+        if layer is not None and layer.l0_node is not None:
+            for sn in layers.slice_nodes():
+                sn.RotateToVolumePlane(layer.l0_node)
+            self.logic.request_views()
+
+    def on_l0_background(self):
+        layer = self.current_fod()
+        if layer is not None and layer.l0_node is not None:
+            slicer.util.setSliceViewerLayers(background=layer.l0_node)
+
+    # ------------------------------------------------------------ ROI actions
+    def on_add_mask(self):
+        node = self.maskSelector.currentNode()
+        if node is None:
+            slicer.util.warningDisplay("Choisis d'abord une segmentation, une labelmap ou un volume.")
+            return
+        with slicer.util.tryWithErrorDisplay("Impossible d'utiliser ce masque", waitCursor=True):
+            self.logic.add_mask_roi(node)
+
+    def refresh_roi_table(self):
+        self._syncing = True
+        try:
+            entries = self.logic.rois
+            self.roiTable.setRowCount(len(entries))
+            for row, e in enumerate(entries):
+                swatch = qt.QTableWidgetItem("")
+                swatch.setFlags(qt.Qt.ItemIsEnabled)
+                swatch.setBackground(qt.QBrush(_qcolor(e.color)))
+                self.roiTable.setItem(row, 0, swatch)
+
+                name = qt.QTableWidgetItem(e.name)
+                name.setToolTip("%s · double-clic pour centrer les coupes" % e.shape_label)
+                if e.shape == "mask":
+                    name.setFlags(qt.Qt.ItemIsEnabled | qt.Qt.ItemIsSelectable)
+                else:
+                    name.setFlags(qt.Qt.ItemIsEnabled | qt.Qt.ItemIsSelectable | qt.Qt.ItemIsEditable)
+                self.roiTable.setItem(row, 1, name)
+
+                mode = qt.QComboBox()
+                for key, label in (("include", "Inclure"), ("exclude", "Exclure"), ("endpoints", "Extrémités")):
+                    mode.addItem(label, key)
+                mode.setCurrentIndex(["include", "exclude", "endpoints"].index(e.mode))
+                mode.currentIndexChanged.connect(lambda i, entry=e, combo=mode: self.logic.set_roi_mode(entry, combo.itemData(i)))
+                self.roiTable.setCellWidget(row, 2, mode)
+
+                enabled = qt.QCheckBox()
+                enabled.checked = e.enabled
+                enabled.toggled.connect(lambda on, entry=e: self.logic.set_roi_enabled(entry, on))
+                self.roiTable.setCellWidget(row, 3, _centered(enabled))
+
+                actions = qt.QWidget()
+                al = qt.QHBoxLayout(actions)
+                al.setContentsMargins(2, 0, 2, 0)
+                al.setSpacing(2)
+                jump = qt.QToolButton()
+                jump.setText("◎")
+                jump.setToolTip("Centrer les coupes sur cette ROI")
+                jump.setAutoRaise(True)
+                jump.clicked.connect(lambda checked=False, entry=e: self.logic.jump_to_roi(entry))
+                delete = qt.QToolButton()
+                trash = _icon("SP_TrashIcon")
+                if trash is not None:
+                    delete.setIcon(trash)
+                else:
+                    delete.setText("✕")
+                delete.setToolTip("Supprimer cette ROI")
+                delete.setAutoRaise(True)
+                delete.clicked.connect(lambda checked=False, entry=e: self.logic.remove_roi(entry))
+                al.addWidget(jump)
+                al.addWidget(delete)
+                self.roiTable.setCellWidget(row, 4, actions)
+        finally:
+            self._syncing = False
+
+    def on_roi_item_changed(self, item):
+        if self._syncing or item.column() != 1:
+            return
+        row = item.row()
+        if 0 <= row < len(self.logic.rois):
+            e = self.logic.rois[row]
+            if e.shape != "mask":
+                e.node.SetName(item.text())
+
+    def on_live_toggled(self, on):
+        self.logic.live = on
+        self.applyButton.enabled = not on
+        if on:
+            self.logic.request_filter()
+
+    def refresh_filter_stats(self):
+        layer = self.current_tract()
+        n_rois = len([e for e in self.logic.rois if e.enabled])
+        if layer is None:
+            self.ratioBar.setValue(0)
+            self.ratioBar.setFormat("Aucun tractogramme")
+            self.filterStats.text = ""
+            return
+        total = layer.n_displayed_total
+        sel = layer.n_selected
+        frac = sel / float(total) if total else 0.0
+        self.ratioBar.setValue(int(round(frac * 1000)))
+        self.ratioBar.setFormat("%s / %s fibres  (%.1f %%)" % (layers._fmt_int(sel), layers._fmt_int(total), 100 * frac))
+        parts = []
+        if n_rois == 0:
+            parts.append("Aucune ROI active : toutes les fibres sont affichées.")
+        if layer.is_subsampled:
+            parts.append("Compté sur le sous-échantillon affiché (%s / %s fibres)."
+                         % (layers._fmt_int(layer.ws.n_streamlines), layers._fmt_int(layer.full.n_streamlines)))
+        if self.logic.last_filter_ms is not None and n_rois:
+            parts.append("Filtrage : %.0f ms" % self.logic.last_filter_ms)
+        self.filterStats.text = "<br>".join(parts)
+
+    def on_export_selection(self):
+        layer = self.current_tract()
+        if layer is None:
+            return
+        base = os.path.splitext(layer.name)[0]
+        start = os.path.join(os.path.dirname(layer.path) if layer.path else self._last_dir(), base + "_filtered.tck")
+        path = qt.QFileDialog.getSaveFileName(slicer.util.mainWindow(), "Enregistrer la sélection", start,
+                                              "Tractogrammes (*.tck)")
+        if not path:
+            return
+        if not path.lower().endswith(".tck"):
+            path += ".tck"
+        with slicer.util.tryWithErrorDisplay("Échec de l'enregistrement", waitCursor=True):
+            n = self.logic.export_selection(layer, path)
+            slicer.util.showStatusMessage("%s fibres enregistrées dans %s" % (layers._fmt_int(n), os.path.basename(path)), 6000)
+
+    def on_selection_to_layer(self):
+        layer = self.current_tract()
+        if layer is None:
+            return
+        with slicer.util.tryWithErrorDisplay("Impossible de créer le tractogramme", waitCursor=True):
+            self.logic.selection_to_layer(layer)
+
+    def on_clear_rois(self):
+        if self.logic.rois and slicer.util.confirmYesNoDisplay("Supprimer toutes les ROI ?"):
+            self.logic.clear_rois()
+
+    # ------------------------------------------------------------ logic events
+    def _on_logic_event(self, event, payload=None):
+        if event == "tracts":
+            self.refresh_tract_list(select=payload)
+            self.refresh_filter_stats()
+        elif event == "fods":
+            self.refresh_fod_list(select=payload)
+        elif event == "rois":
+            self.refresh_roi_table()
+            self.refresh_filter_stats()
+        elif event == "filtered":
+            self.refresh_filter_stats()
+        elif event == "views":
+            self.refresh_fod_count()
+
+
+class _WaitCursor(object):
+    def __enter__(self):
+        qt.QApplication.setOverrideCursor(qt.QCursor(qt.Qt.WaitCursor))
+        return self
+
+    def __exit__(self, *args):
+        qt.QApplication.restoreOverrideCursor()
+        return False
+
+
+def _centered(widget):
+    w = qt.QWidget()
+    l = qt.QHBoxLayout(w)
+    l.setContentsMargins(0, 0, 0, 0)
+    l.addStretch(1)
+    l.addWidget(widget)
+    l.addStretch(1)
+    return w
+
+
+#
+# Logic
+#
+
+class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
+
+    def __init__(self):
+        ScriptedLoadableModuleLogic.__init__(self)
+        VTKObservationMixin.__init__(self)
+        self.tract_layers = []
+        self.fod_layers = []
+        self.rois = []
+        self.include_mode = "all"
+        self.live = True
+        self.rois_visible = True
+        self.last_filter_ms = None
+        self._listeners = []
+        self._dirty_views = set()
+        self._all_views_dirty = False
+
+        self._view_timer = qt.QTimer()
+        self._view_timer.setSingleShot(True)
+        self._view_timer.setInterval(10)
+        self._view_timer.connect("timeout()", self._process_views)
+        self._filter_timer = qt.QTimer()
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(5)
+        self._filter_timer.connect("timeout()", self.apply_filters)
+
+        self._observe_slice_nodes()
+        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.NodeAddedEvent, self._on_node_added)
+        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.NodeAboutToBeRemovedEvent, self._on_node_removed)
+        self.addObserver(slicer.mrmlScene, slicer.mrmlScene.StartCloseEvent, self._on_scene_closing)
+
+    def cleanup(self):
+        self._view_timer.stop()
+        self._filter_timer.stop()
+        self.removeObservers()
+
+    # -- listeners ---------------------------------------------------------------
+    def add_listener(self, fn):
+        self._listeners.append(fn)
+
+    def _notify(self, event, payload=None):
+        for fn in list(self._listeners):
+            try:
+                fn(event, payload)
+            except Exception as exc:  # never let a GUI refresh break the pipeline
+                import traceback
+                traceback.print_exc()
+
+    # -- scene observation ---------------------------------------------------------
+    def _observe_slice_nodes(self):
+        for sn in slicer.util.getNodesByClass("vtkMRMLSliceNode"):
+            if not self.hasObserver(sn, vtk.vtkCommand.ModifiedEvent, self._on_slice_modified):
+                self.addObserver(sn, vtk.vtkCommand.ModifiedEvent, self._on_slice_modified)
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _on_node_added(self, caller, event, node):
+        if node is not None and node.IsA("vtkMRMLSliceNode"):
+            self._observe_slice_nodes()
+            self.request_views()
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _on_node_removed(self, caller, event, node):
+        if node is None:
+            return
+        for e in list(self.rois):
+            if e.node is node:
+                self._drop_roi(e, remove_node=False)
+                self._notify("rois")
+                self.request_filter()
+        for layer in list(self.tract_layers):
+            if layer.model3d is node:
+                layer.model3d = None
+                self.remove_tract(layer)
+
+    def _on_scene_closing(self, caller=None, event=None):
+        self.tract_layers = []
+        self.fod_layers = []
+        for e in self.rois:
+            self._unobserve_roi(e)
+        self.rois = []
+        self._notify("tracts")
+        self._notify("fods")
+        self._notify("rois")
+        qt.QTimer.singleShot(0, self._observe_slice_nodes)
+
+    def _on_slice_modified(self, caller, event):
+        self._dirty_views.add(caller.GetID())
+        if not self._view_timer.isActive():
+            self._view_timer.start()
+
+    def request_views(self):
+        self._all_views_dirty = True
+        if not self._view_timer.isActive():
+            self._view_timer.start()
+
+    def _process_views(self):
+        nodes = layers.slice_nodes()
+        if not self._all_views_dirty:
+            nodes = [n for n in nodes if n.GetID() in self._dirty_views]
+        self._dirty_views = set()
+        self._all_views_dirty = False
+        if not nodes:
+            return
+        for sn in nodes:
+            for layer in self.tract_layers:
+                try:
+                    layer.update_slab(sn)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+            for fod in self.fod_layers:
+                try:
+                    fod.update_view(sn)
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+        if self.fod_layers:
+            self._notify("views")
+
+    # -- loading ---------------------------------------------------------------------
+    def load_tractogram(self, path, name=None):
+        data = mrtrix_io.read_tck(path)
+        name = name or os.path.basename(path)
+        t = tracts.Tractogram(data["points"], data["offsets"], data["header"], name)
+        return self.add_tractogram(t, name, path)
+
+    def add_tractogram(self, tractogram, name, path=None, max_display=150000):
+        first = not self.tract_layers and not self.fod_layers
+        layer = layers.TractLayer(tractogram, name, path, max_display=max_display)
+        cmap = slicer.mrmlScene.GetNodeByID("vtkMRMLColorTableNodeFileViridis.txt")
+        layer.colormap_id = cmap.GetID() if cmap is not None else None
+        self.tract_layers.append(layer)
+        qt.QTimer.singleShot(0, layer.apply_tubes)
+        if self.rois:
+            self.apply_filters()
+        self.request_views()
+        if first:
+            self._center_on_tracts(layer)
+        self._notify("tracts", layer)
+        return layer
+
+    def _center_on_tracts(self, layer):
+        if layer.ws.n_points == 0:
+            return
+        has_bg = False
+        lm = slicer.app.layoutManager()
+        for name in lm.sliceViewNames():
+            if lm.sliceWidget(name).sliceLogic().GetSliceCompositeNode().GetBackgroundVolumeID():
+                has_bg = True
+        center = np.median(layer.ws.points[:: max(1, layer.ws.n_points // 50000)], axis=0)
+        if not has_bg:
+            lo, hi = layer.ws.points.min(0), layer.ws.points.max(0)
+            fov = float(np.max(hi - lo)) * 1.3 + 10
+            for sn in layers.slice_nodes():
+                sn.JumpSliceByCentering(*[float(x) for x in center])
+                w, h = sn.GetDimensions()[:2]
+                w, h = max(w, 1), max(h, 1)
+                fx, fy = (fov * w / h, fov) if w >= h else (fov, fov * h / w)
+                sn.SetFieldOfView(fx, fy, sn.GetFieldOfView()[2])
+        else:
+            for sn in layers.slice_nodes():
+                sn.JumpSliceByOffsetting(*[float(x) for x in center])
+        self.reset_3d_camera()
+
+    def reset_3d_camera(self):
+        lm = slicer.app.layoutManager()
+        for i in range(lm.threeDViewCount):
+            view = lm.threeDWidget(i).threeDView()
+            view.resetFocalPoint()
+            view.resetCamera()
+
+    def recenter_views(self):
+        slicer.util.resetSliceViews()
+        self.reset_3d_camera()
+
+    def load_tsf(self, layer, path):
+        data = mrtrix_io.read_tsf(path)
+        if data["offsets"].size - 1 != layer.full.n_streamlines:
+            raise ValueError("Le fichier .tsf contient %d fibres, le tractogramme %d."
+                             % (data["offsets"].size - 1, layer.full.n_streamlines))
+        layer.set_tsf(data["values"], os.path.basename(path))
+
+    def load_fod(self, path):
+        image = mrtrix_io.read_image(path)
+        if not mrtrix_io.is_sh_image(image):
+            raise ValueError("%s n'est pas une image d'harmoniques sphériques (4e dimension = %s)."
+                             % (os.path.basename(path), image.data.shape[3:] or "absente"))
+        layer = layers.FODLayer(image, os.path.basename(path), path)
+        del image
+        self.fod_layers.append(layer)
+        self.request_views()
+        self._notify("fods", layer)
+        return layer
+
+    def load_image(self, path):
+        low = path.lower()
+        if low.endswith((".mif", ".mif.gz", ".mih")):
+            image = mrtrix_io.read_mif(path)
+            node = layers.add_volume_from_image(image, os.path.basename(path).split(".")[0], 0, show=True)
+        else:
+            node = slicer.util.loadVolume(path)
+            slicer.util.setSliceViewerLayers(background=node, fit=True)
+        self.request_views()
+        return node
+
+    def set_max_display(self, layer, value):
+        layer.set_max_display(value)
+        if self.rois:
+            self.apply_filters()
+        layer.invalidate_slabs()
+        self.request_views()
+        self._notify("filtered")
+
+    def remove_tract(self, layer):
+        if layer in self.tract_layers:
+            self.tract_layers.remove(layer)
+        layer.remove()
+        self._notify("tracts")
+
+    def remove_fod(self, layer):
+        if layer in self.fod_layers:
+            self.fod_layers.remove(layer)
+        layer.remove()
+        self._notify("fods")
+
+    # -- ROIs ------------------------------------------------------------------------
+    def _default_roi_center(self):
+        center = layers.slice_intersection_point()
+        if self.tract_layers:
+            pts = self.tract_layers[0].ws.points
+            if pts.shape[0]:
+                lo, hi = pts.min(0), pts.max(0)
+                if center is None or np.any(center < lo - 5) or np.any(center > hi + 5):
+                    center = np.median(pts[:: max(1, pts.shape[0] // 50000)], axis=0)
+        return center if center is not None else np.zeros(3)
+
+    def add_roi(self, shape, mode="include", center=None, size=None):
+        count = sum(1 for e in self.rois if e.shape == shape) + 1
+        prefix = {"box": "Boîte", "sphere": "Sphère"}[shape]
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", "%s %d" % (prefix, count))
+        node.CreateDefaultDisplayNodes()
+        center = self._default_roi_center() if center is None else np.asarray(center, float)
+        size = size or (10.0 if shape == "box" else 8.0)
+        node.SetCenter([float(x) for x in center])
+        node.SetSize([float(size)] * 3)
+        node.SetAttribute("MRView.Shape", shape)
+        layers.put_in_folder(node)
+        entry = layers.ROIEntry(node, shape, mode)
+        entry.apply_color()
+        entry.update_sphere_model()
+        entry.set_visible(self.rois_visible)
+        self._observe_roi(entry)
+        self.rois.append(entry)
+        self._notify("rois")
+        self.apply_filters()
+        return entry
+
+    def add_mask_roi(self, node, mode="include"):
+        added = []
+        if node.IsA("vtkMRMLSegmentationNode"):
+            seg = node.GetSegmentation()
+            for i in range(seg.GetNumberOfSegments()):
+                sid = seg.GetNthSegmentID(i)
+                entry = layers.ROIEntry(node, "mask", mode, segment_id=sid)
+                entry.load_mask()
+                added.append(entry)
+        else:
+            entry = layers.ROIEntry(node, "mask", mode)
+            entry.load_mask()
+            added.append(entry)
+        if not added:
+            raise ValueError("Cette segmentation ne contient aucun segment.")
+        for entry in added:
+            entry.apply_color()
+            self._observe_roi(entry)
+            self.rois.append(entry)
+        self._notify("rois")
+        self.apply_filters()
+        return added
+
+    def _observe_roi(self, entry):
+        node = entry.node
+        if entry.shape in ("box", "sphere"):
+            for ev in (slicer.vtkMRMLMarkupsNode.PointModifiedEvent, vtk.vtkCommand.ModifiedEvent):
+                entry.observer_tags.append((node, node.AddObserver(ev, lambda c, e, entry=entry: self._on_roi_moved(entry))))
+            ev_end = getattr(slicer.vtkMRMLMarkupsNode, "PointEndInteractionEvent", None)
+            if ev_end is not None:
+                entry.observer_tags.append((node, node.AddObserver(ev_end, lambda c, e: self._on_roi_released())))
+        elif node.IsA("vtkMRMLSegmentationNode"):
+            seg = node.GetSegmentation()
+            for name in ("SourceRepresentationModified", "MasterRepresentationModified"):
+                ev = getattr(slicer.vtkSegmentation, name, None)
+                if ev is not None:
+                    entry.observer_tags.append((seg, seg.AddObserver(ev, lambda c, e, entry=entry: self._on_mask_modified(entry))))
+                    break
+        else:
+            ev = slicer.vtkMRMLVolumeNode.ImageDataModifiedEvent
+            entry.observer_tags.append((node, node.AddObserver(ev, lambda c, e, entry=entry: self._on_mask_modified(entry))))
+
+    def _unobserve_roi(self, entry):
+        for obj, tag in entry.observer_tags:
+            try:
+                obj.RemoveObserver(tag)
+            except Exception:
+                pass
+        entry.observer_tags = []
+
+    def _on_roi_moved(self, entry):
+        if entry.shape == "sphere":
+            entry.update_sphere_model()
+        if self.live:
+            self.request_filter()
+
+    def _on_roi_released(self):
+        if not self.live:
+            self.request_filter()
+
+    def _on_mask_modified(self, entry):
+        entry._mask = None
+        entry.version += 1
+        if self.live:
+            self.request_filter()
+
+    def set_roi_mode(self, entry, mode):
+        entry.mode = mode
+        entry.apply_color()
+        self._notify("rois")
+        self.apply_filters()
+
+    def set_roi_enabled(self, entry, enabled):
+        entry.enabled = enabled
+        entry.set_visible(enabled and self.rois_visible)
+        self.apply_filters()
+
+    def set_rois_visible(self, visible):
+        self.rois_visible = visible
+        for e in self.rois:
+            e.set_visible(visible and e.enabled)
+
+    def set_include_mode(self, mode):
+        self.include_mode = mode
+        self.apply_filters()
+
+    def _drop_roi(self, entry, remove_node=True):
+        self._unobserve_roi(entry)
+        if entry in self.rois:
+            self.rois.remove(entry)
+        entry.remove(remove_node=remove_node)
+        for layer in self.tract_layers:
+            for key in [k for k in layer.roi_cache if k[0] == entry.uid]:
+                del layer.roi_cache[key]
+
+    def remove_roi(self, entry):
+        if isinstance(entry, int):
+            entry = self.rois[entry]
+        self._drop_roi(entry, remove_node=True)
+        self._notify("rois")
+        self.apply_filters()
+
+    def clear_rois(self):
+        for e in list(self.rois):
+            self._drop_roi(e, remove_node=True)
+        self._notify("rois")
+        self.apply_filters()
+
+    def jump_to_roi(self, entry):
+        if isinstance(entry, int):
+            if not (0 <= entry < len(self.rois)):
+                return
+            entry = self.rois[entry]
+        if entry.shape == "mask":
+            mask, A = entry._mask, entry._ras_to_ijk
+            if mask is None:
+                entry.load_mask()
+                mask, A = entry._mask, entry._ras_to_ijk
+            ijk = np.argwhere(mask)
+            if not ijk.size:
+                return
+            c_ijk = ijk.mean(0)
+            Ainv = np.linalg.inv(A)
+            center = Ainv[:3, :3] @ c_ijk + Ainv[:3, 3]
+        else:
+            c = [0.0, 0.0, 0.0]
+            entry.node.GetCenterWorld(c)
+            center = c
+        for sn in layers.slice_nodes():
+            sn.JumpSliceByCentering(*[float(x) for x in center])
+
+    # -- filtering -------------------------------------------------------------------
+    def request_filter(self):
+        if not self._filter_timer.isActive():
+            self._filter_timer.start()
+
+    def apply_filters(self):
+        t0 = time.time()
+        entries = [e for e in self.rois if e.enabled]
+        for layer in self.tract_layers:
+            incl, excl = [], []
+            for e in entries:
+                key = (e.uid, e.mode == "endpoints")
+                try:
+                    sig = e.signature()
+                except Exception:
+                    continue
+                cached = layer.roi_cache.get(key)
+                if cached is None or cached[0] != sig:
+                    hits = tracts.streamline_hits(layer.ws, e.point_test(), endpoints_only=(e.mode == "endpoints"))
+                    layer.roi_cache[key] = (sig, hits)
+                else:
+                    hits = cached[1]
+                (excl if e.mode == "exclude" else incl).append(hits)
+            sel = tracts.combine_selection(layer.ws.n_streamlines, incl, excl, self.include_mode)
+            if layer.set_selection(sel):
+                layer.invalidate_slabs()
+        self.last_filter_ms = 1000.0 * (time.time() - t0)
+        # update 2D slabs right away so 2D and 3D stay in sync while dragging
+        self._all_views_dirty = True
+        self._process_views()
+        self._notify("filtered")
+
+    def full_selection(self, layer):
+        entries = [e for e in self.rois if e.enabled]
+        return layer.selection_for_full(entries, self.include_mode)
+
+    def export_selection(self, layer, path):
+        sel = self.full_selection(layer)
+        sub = layer.full.subset(np.flatnonzero(sel))
+        header = {k: v for k, v in layer.full.header.items() if k not in ("count", "total_count", "file", "datatype", "timestamp")}
+        mrtrix_io.write_tck(path, sub.points, sub.offsets, header)
+        return sub.n_streamlines
+
+    def selection_to_layer(self, layer):
+        sel = self.full_selection(layer)
+        sub = layer.full.subset(np.flatnonzero(sel))
+        name = os.path.splitext(layer.name)[0] + " (sélection)"
+        new = self.add_tractogram(sub, name, None, max_display=layer.max_display)
+        new.color_mode = layer.color_mode
+        new.solid_color = layer.solid_color
+        new.apply_display()
+        return new
+
+
+#
+# Test
+#
+
+class MRViewTest(ScriptedLoadableModuleTest):
+
+    def setUp(self):
+        slicer.mrmlScene.Clear(0)
+
+    def runTest(self):
+        self.setUp()
+        self.test_synthetic_pipeline()
+
+    def test_synthetic_pipeline(self):
+        import tempfile
+        self.delayDisplay("Création de données synthétiques")
+        rng = np.random.RandomState(0)
+        lengths = rng.randint(20, 60, size=300)
+        starts = rng.uniform(-30, 30, size=(300, 3))
+        dirs = rng.randn(300, 3)
+        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+        pts = np.concatenate([s + np.outer(np.arange(n), d) for s, d, n in zip(starts, dirs, lengths)]).astype(np.float32)
+        offsets = np.concatenate(([0], np.cumsum(lengths)))
+        tmp = tempfile.mkdtemp()
+        tck = os.path.join(tmp, "synthetic.tck")
+        mrtrix_io.write_tck(tck, pts, offsets)
+
+        # small lmax 4 FOD with a single fibre along x
+        from MRViewLib import sh
+        coefs = sh.sh_basis(np.array([[1.0, 0, 0]]), 4)[0]
+        data = np.zeros((10, 10, 10, 15), np.float32)
+        data[2:8, 2:8, 2:8] = coefs
+        M = np.diag([2.0, 2.0, 2.0, 1.0])
+        M[:3, 3] = -10
+        fod = os.path.join(tmp, "fod.mif")
+        mrtrix_io.write_mif(fod, data, M)
+
+        logic = MRViewLogic()
+        layer = logic.load_tractogram(tck)
+        self.assertEqual(layer.full.n_streamlines, 300)
+        fod_layer = logic.load_fod(fod)
+        self.assertEqual(fod_layer.lmax, 4)
+        logic._process_views()
+        self.assertTrue(sum(fod_layer.glyph_counts.values()) > 0)
+
+        for mode, _ in COLOR_MODES[:5]:
+            layer.color_mode = mode
+            layer.apply_display()
+
+        self.delayDisplay("ROI")
+        entry = logic.add_roi("sphere", "include", center=pts[0], size=6.0)
+        self.assertTrue(0 < layer.n_selected < 300)
+        n_incl = layer.n_selected
+        logic.set_roi_mode(entry, "exclude")
+        self.assertEqual(layer.n_selected, 300 - n_incl)
+        out = os.path.join(tmp, "filtered.tck")
+        n = logic.export_selection(layer, out)
+        self.assertEqual(n, 300 - n_incl)
+        self.assertEqual(mrtrix_io.read_tck(out)["offsets"].size - 1, n)
+        logic.cleanup()
+        self.delayDisplay("Test réussi")
