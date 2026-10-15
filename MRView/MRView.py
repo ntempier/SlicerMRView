@@ -10,7 +10,16 @@ from slicer.ScriptedLoadableModule import (ScriptedLoadableModule, ScriptedLoada
                                            ScriptedLoadableModuleTest, ScriptedLoadableModuleWidget)
 from slicer.util import VTKObservationMixin
 
-from MRViewLib import layers, mrtrix_io, tracts
+import importlib
+
+from MRViewLib import mrtrix_io, sh, tracts, vtk_utils, layers
+
+# Slicer only re-executes MRView.py on "Reload" (or after a git pull without a full
+# restart): reload the helper modules too, in dependency order, so they never go stale.
+for _mod in (mrtrix_io, sh, tracts, vtk_utils, layers):
+    importlib.reload(_mod)
+del _mod
+
 from MRViewLib.layers import COLOR_MODES, DETAIL_LEVELS, ROI_MODE_COLORS
 
 
