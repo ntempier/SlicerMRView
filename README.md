@@ -7,6 +7,7 @@ Module Python (scripted module) pour 3D Slicer 5.x qui reproduit les fonctions p
 - **FOD / ODF** (`.mif`, `.mif.gz`, `.nii`, `.nii.gz`, convention SH de MRtrix3) en glyphes colorés par direction dans les coupes 2D et en 3D : taille, seuil, niveau de détail, normalisation, couleur unie. Le terme l=0 est chargé comme image de fond.
 - **Filtrage en direct par ROI** : boîtes et sphères déplaçables à la souris, masques (labelmap, volume binaire, segments d'une segmentation). Rôles : *Inclure*, *Exclure*, *Extrémités*. Inclusions combinées en ET ou en OU.
 - **Export** de la sélection en `.tck` (calculé sur le tractogramme complet) ou création d'un nouveau tractogramme.
+- **FA couleur (RVB)** : les cartes de vecteurs à 3 volumes (par ex. `tensor2metric -vector`, `.mif` ou NIfTI) s'affichent en couleurs comme dans mrview (|x| rouge, |y| vert, |z| bleu), en image de fond ou superposées au T1, avec luminosité et opacité réglables.
 - Images anatomiques `.mif` / NIfTI.
 
 Aucune dépendance en plus de Slicer : les fichiers MRtrix et NIfTI sont lus avec numpy.
@@ -21,10 +22,11 @@ Pour en faire une extension installable, le dossier `SlicerMRView` contient déj
 
 ## Utilisation rapide
 
-1. **Ouvrir des fichiers…** : sélectionne en une fois le T1, les FOD et le `.tck`. Le type est détecté automatiquement (une image 4D avec 15/28/45/66/91 volumes est traitée comme FOD). Les boutons *Tractogramme / FOD / Image* forcent le type.
+1. **Ouvrir des fichiers…** : sélectionne en une fois le T1, les FOD et le `.tck`. Le type est détecté automatiquement (une image 4D avec 15/28/45/66/91 volumes est traitée comme FOD, une image à 3 volumes comme carte FA couleur). Les boutons *Tractogramme / FOD / Image / FA couleur* forcent le type.
 2. Section **Tractographie** : couleur, épaisseur, tranche 2D, tubes.
 3. Section **ODF / FOD** : taille et seuil des glyphes. *Aligner les coupes sur la grille* oriente les vues selon l'image FOD (utile pour une acquisition oblique).
-4. Section **Filtrage par ROI** : *+ Boîte* / *+ Sphère* (vert = inclure, rouge = exclure), puis déplace les poignées dans les vues. Le rôle se change dans le tableau ; double-clic sur une ligne pour centrer les coupes sur la ROI.
+4. Section **FA couleur (RVB)** : *Luminosité* (1 = le 99,5e percentile en pleine intensité), *Affichage* en image de fond ou superposée à l'image de fond précédente, *Opacité*.
+5. Section **Filtrage par ROI** : *+ Boîte* / *+ Sphère* (vert = inclure, rouge = exclure), puis déplace les poignées dans les vues. Le rôle se change dans le tableau ; double-clic sur une ligne pour centrer les coupes sur la ROI.
 
 ### Gros tractogrammes
 

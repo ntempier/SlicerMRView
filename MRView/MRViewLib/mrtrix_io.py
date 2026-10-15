@@ -413,3 +413,16 @@ def looks_like_fod(path):
     except Exception:
         return False
     return len(dims) == 4 and dims[3] in (15, 28, 45, 66, 91)
+
+
+def looks_like_vector(path):
+    """Heuristic: 3 values per voxel (e.g. `tensor2metric -vector`, colour-coded FA)."""
+    try:
+        dims = peek_image_dims(path)
+    except Exception:
+        return False
+    return len(dims) >= 4 and int(np.prod(dims[3:])) == 3
+
+
+def is_vector_image(image):
+    return image.data.ndim >= 4 and int(np.prod(image.data.shape[3:])) == 3

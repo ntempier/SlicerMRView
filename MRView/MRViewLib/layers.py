@@ -166,6 +166,69 @@ def add_volume_from_image(image, name, index=0, show=True):
     return node
 
 
+def vector_reference(vec):
+    """Brightness reference of a vector map: 99.5th percentile of the largest component."""
+    peak = np.abs(vec).max(axis=-1)
+    vals = peak[peak > 0]
+    if vals.size == 0:
+        return 1.0
+    ref = float(np.percentile(vals, 99.5))
+    return ref if ref > 0 else float(vals.max())
+
+
+def vector_to_rgb(vec, ref, gain=1.0):
+    """[i,j,k,3] vectors -> uint8 RGB array in Slicer order [k,j,i,3].
+
+    Same mapping as mrview's RGB colour map: |x| -> red, |y| -> green, |z| -> blue,
+    scaled so that `ref / gain` is full brightness.
+    """
+    scale = 255.0 * gain / max(ref, 1e-12)
+    out = np.empty(vec.shape, dtype=np.float32)
+    np.abs(vec, out=out)
+    out *= scale
+    np.clip(out, 0, 255, out=out)
+    return np.ascontiguousarray(np.transpose(out.astype(np.uint8), (2, 1, 0, 3)))
+
+
+class RGBLayer(object):
+    """Colour-coded vector map (e.g. FA-weighted principal eigenvector) shown as an RGB volume."""
+
+    def __init__(self, image, name, path=None):
+        self.uid = next(_uid)
+        self.name = name
+        self.path = path
+        vec = np.array(image.data, dtype=np.float32)  # own writable copy (file data may be read-only)
+        vec = vec.reshape(vec.shape[:3] + (3,))
+        self.vec = np.nan_to_num(vec, copy=False)
+        self.ref = vector_reference(self.vec)
+        self.gain = 1.0
+        self.spacing = image.spacing
+        self.node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVectorVolumeNode", name.split(".")[0])
+        self.node.SetIJKToRASMatrix(vtk_matrix(image.ijk_to_ras))
+        slicer.util.updateVolumeFromArray(self.node, vector_to_rgb(self.vec, self.ref, self.gain))
+        self.node.CreateDefaultDisplayNodes()
+        dn = self.node.GetDisplayNode()
+        if dn is not None:
+            dn.SetAutoWindowLevel(False)
+            dn.SetWindowLevel(255.0, 127.5)
+        put_in_folder(self.node)
+
+    def info_text(self):
+        i, j, k = self.vec.shape[:3]
+        sp = self.spacing
+        return "%d × %d × %d voxels · %.2g × %.2g × %.2g mm" % (i, j, k, sp[0], sp[1], sp[2])
+
+    def set_gain(self, gain):
+        self.gain = float(gain)
+        if self.node is not None and self.node.GetScene() is not None:
+            slicer.util.updateVolumeFromArray(self.node, vector_to_rgb(self.vec, self.ref, self.gain))
+
+    def remove(self):
+        if self.node is not None and self.node.GetScene() is not None:
+            slicer.mrmlScene.RemoveNode(self.node)
+        self.node = None
+
+
 def colormap_lut(color_node_id, n=256):
     node = slicer.mrmlScene.GetNodeByID(color_node_id) if color_node_id else None
     lut = node.GetLookupTable() if node is not None else None

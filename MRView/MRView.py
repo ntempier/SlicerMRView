@@ -149,12 +149,14 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._build_data_section()
         self._build_tract_section()
         self._build_fod_section()
+        self._build_rgb_section()
         self._build_roi_section()
         self._build_help_section()
         self.layout.addStretch(1)
 
         self.refresh_tract_list()
         self.refresh_fod_list()
+        self.refresh_rgb_list()
         self.refresh_roi_table()
         self.refresh_filter_stats()
 
@@ -195,10 +197,13 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.openTckButton = _button("Tractogramme", "mrSoft", "Ouvrir un ou plusieurs fichiers .tck")
         self.openFodButton = _button("FOD", "mrSoft", "Ouvrir une image d'harmoniques sphériques (FOD)")
         self.openImageButton = _button("Image", "mrSoft", "Ouvrir une image anatomique (T1, FA, …)")
+        self.openRgbButton = _button("FA couleur", "mrSoft",
+                                     "Ouvrir une carte de vecteurs à 3 volumes (tensor2metric -vector) en RVB, comme mrview")
         self.openTckButton.clicked.connect(lambda: self.on_open_files("tck"))
         self.openFodButton.clicked.connect(lambda: self.on_open_files("fod"))
         self.openImageButton.clicked.connect(lambda: self.on_open_files("image"))
-        v.addWidget(_hbox(self.openTckButton, self.openFodButton, self.openImageButton))
+        self.openRgbButton.clicked.connect(lambda: self.on_open_files("rgb"))
+        v.addWidget(_hbox(self.openTckButton, self.openFodButton, self.openImageButton, self.openRgbButton))
 
         layout_label = qt.QLabel("Disposition :")
         buttons = []
@@ -410,6 +415,144 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.alignButton.clicked.connect(self.on_align_to_fod)
         self.l0Button.clicked.connect(self.on_l0_background)
 
+    # -- colour-coded FA / vector maps --------------------------------------------
+    def _build_rgb_section(self):
+        box = ctk.ctkCollapsibleButton()
+        box.text = "FA couleur (RVB)"
+        self.layout.addWidget(box)
+        v = qt.QVBoxLayout(box)
+
+        self.rgbCombo = qt.QComboBox()
+        self.rgbCombo.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
+        self.rgbRemove = qt.QToolButton()
+        trash = _icon("SP_TrashIcon")
+        if trash is not None:
+            self.rgbRemove.setIcon(trash)
+        else:
+            self.rgbRemove.setText("✕")
+        self.rgbRemove.setToolTip("Fermer cette carte")
+        v.addWidget(_hbox(self.rgbCombo, self.rgbRemove))
+
+        self.rgbInfo = qt.QLabel("")
+        self.rgbInfo.setObjectName("mrHint")
+        self.rgbInfo.setWordWrap(True)
+        v.addWidget(self.rgbInfo)
+
+        self.rgbForm = qt.QWidget()
+        form = qt.QFormLayout(self.rgbForm)
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setFieldGrowthPolicy(qt.QFormLayout.AllNonFixedFieldsGrow)
+        v.addWidget(self.rgbForm)
+
+        self.rgbGain = _slider(0.2, 5.0, 0.05, 1.0)
+        self.rgbGain.setToolTip("Multiplie l'intensité des couleurs (1 = le 99,5e percentile est à pleine luminosité).")
+        form.addRow("Luminosité", self.rgbGain)
+        self.rgbMode = qt.QComboBox()
+        self.rgbMode.addItem("Image de fond", "background")
+        self.rgbMode.addItem("Superposée à l'image de fond", "overlay")
+        self.rgbMode.setToolTip("Superposée : la carte RVB s'affiche par-dessus l'image qui était en fond (T1, …).")
+        form.addRow("Affichage", self.rgbMode)
+        self.rgbOpacity = _slider(0.0, 1.0, 0.05, 0.6)
+        self.rgbOpacityLabel = qt.QLabel("Opacité")
+        form.addRow(self.rgbOpacityLabel, self.rgbOpacity)
+
+        self.rgbEmpty = qt.QLabel("Aucune carte chargée. Bouton « FA couleur » (ou « Ouvrir des fichiers… ») "
+                                  "pour une image à 3 volumes, par ex. la sortie de tensor2metric -vector.")
+        self.rgbEmpty.setObjectName("mrHint")
+        self.rgbEmpty.setWordWrap(True)
+        v.addWidget(self.rgbEmpty)
+
+        self._rgb_gain_timer = qt.QTimer()
+        self._rgb_gain_timer.setSingleShot(True)
+        self._rgb_gain_timer.setInterval(30)
+        self._rgb_gain_timer.connect("timeout()", self._apply_rgb_gain)
+
+        self.rgbCombo.currentIndexChanged.connect(self.on_rgb_selected)
+        self.rgbRemove.clicked.connect(self.on_remove_rgb)
+        self.rgbGain.connect("valueChanged(double)", lambda x: self._syncing or self._rgb_gain_timer.start())
+        self.rgbMode.currentIndexChanged.connect(self.on_rgb_mode)
+        self.rgbOpacity.connect("valueChanged(double)", self.on_rgb_opacity)
+
+    def current_rgb(self):
+        i = self.rgbCombo.currentIndex
+        if 0 <= i < len(self.logic.rgb_layers):
+            return self.logic.rgb_layers[i]
+        return None
+
+    def refresh_rgb_list(self, select=None):
+        self._syncing = True
+        try:
+            current = select if select is not None else self.current_rgb()
+            self.rgbCombo.clear()
+            for layer in self.logic.rgb_layers:
+                self.rgbCombo.addItem(layer.name)
+            if current in self.logic.rgb_layers:
+                self.rgbCombo.setCurrentIndex(self.logic.rgb_layers.index(current))
+            elif self.logic.rgb_layers:
+                self.rgbCombo.setCurrentIndex(len(self.logic.rgb_layers) - 1)
+        finally:
+            self._syncing = False
+        self.sync_rgb_controls()
+
+    def sync_rgb_controls(self):
+        layer = self.current_rgb()
+        has = layer is not None
+        self.rgbCombo.visible = has
+        self.rgbRemove.visible = has
+        self.rgbForm.visible = has
+        self.rgbInfo.visible = has
+        self.rgbEmpty.visible = not has
+        if not has:
+            return
+        self._syncing = True
+        try:
+            self.rgbInfo.text = layer.info_text()
+            self.rgbGain.value = layer.gain
+            self.rgbMode.setCurrentIndex(1 if layer.mode == "overlay" else 0)
+            self.rgbOpacity.value = layer.opacity
+            self.rgbOpacity.enabled = layer.mode == "overlay"
+            self.rgbOpacityLabel.enabled = layer.mode == "overlay"
+        finally:
+            self._syncing = False
+
+    def on_rgb_selected(self, index):
+        if self._syncing:
+            return
+        self.sync_rgb_controls()
+        layer = self.current_rgb()
+        if layer is not None:
+            self.logic.show_rgb(layer)
+
+    def _apply_rgb_gain(self):
+        layer = self.current_rgb()
+        if layer is not None:
+            layer.set_gain(self.rgbGain.value)
+
+    def on_rgb_mode(self, index):
+        if self._syncing:
+            return
+        layer = self.current_rgb()
+        if layer is None:
+            return
+        layer.mode = self.rgbMode.itemData(index)
+        self.logic.show_rgb(layer)
+        self.sync_rgb_controls()
+
+    def on_rgb_opacity(self, value):
+        if self._syncing:
+            return
+        layer = self.current_rgb()
+        if layer is None:
+            return
+        layer.opacity = value
+        if layer.mode == "overlay":
+            self.logic.show_rgb(layer)
+
+    def on_remove_rgb(self):
+        layer = self.current_rgb()
+        if layer is not None:
+            self.logic.remove_rgb(layer)
+
     # -- ROI --------------------------------------------------------------------
     def _build_roi_section(self):
         box = ctk.ctkCollapsibleButton()
@@ -540,6 +683,7 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             "tck": "Tractogrammes (*.tck);;Tous (*)",
             "fod": "Images FOD (*.mif *.mif.gz *.mih *.nii *.nii.gz);;Tous (*)",
             "image": "Images (*.mif *.mif.gz *.mih *.nii *.nii.gz *.nrrd);;Tous (*)",
+            "rgb": "Cartes de vecteurs (*.mif *.mif.gz *.mih *.nii *.nii.gz);;Tous (*)",
         }
         start = self._last_dir()
         paths = qt.QFileDialog.getOpenFileNames(slicer.util.mainWindow(), "Ouvrir", start, filters[kind])
@@ -562,6 +706,8 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 kind = "tsf"
             elif mrtrix_io.looks_like_fod(path):
                 kind = "fod"
+            elif mrtrix_io.looks_like_vector(path):
+                kind = "rgb"
             else:
                 kind = "image"
         name = os.path.basename(path)
@@ -580,6 +726,8 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     self._select_color_mode("tsf")
                 elif kind == "fod":
                     self.logic.load_fod(path)
+                elif kind == "rgb":
+                    self.logic.load_rgb(path)
                 else:
                     self.logic.load_image(path)
                 slicer.util.showStatusMessage("%s chargé en %.1f s" % (name, time.time() - t0), 4000)
@@ -988,6 +1136,8 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.refresh_filter_stats()
         elif event == "fods":
             self.refresh_fod_list(select=payload)
+        elif event == "rgbs":
+            self.refresh_rgb_list(select=payload)
         elif event == "rois":
             self.refresh_roi_table()
             self.refresh_filter_stats()
@@ -1028,6 +1178,7 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         VTKObservationMixin.__init__(self)
         self.tract_layers = []
         self.fod_layers = []
+        self.rgb_layers = []
         self.rois = []
         self.include_mode = "all"
         self.live = True
@@ -1093,15 +1244,22 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             if layer.model3d is node:
                 layer.model3d = None
                 self.remove_tract(layer)
+        for layer in list(self.rgb_layers):
+            if layer.node is node:
+                layer.node = None
+                self.rgb_layers.remove(layer)
+                self._notify("rgbs")
 
     def _on_scene_closing(self, caller=None, event=None):
         self.tract_layers = []
         self.fod_layers = []
+        self.rgb_layers = []
         for e in self.rois:
             self._unobserve_roi(e)
         self.rois = []
         self._notify("tracts")
         self._notify("fods")
+        self._notify("rgbs")
         self._notify("rois")
         qt.QTimer.singleShot(0, self._observe_slice_nodes)
 
@@ -1214,7 +1372,66 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._notify("fods", layer)
         return layer
 
+    def load_rgb(self, path):
+        image = mrtrix_io.read_image(path)
+        if not mrtrix_io.is_vector_image(image):
+            raise ValueError("%s n'est pas une carte de vecteurs : il faut 3 volumes (dimensions %s)."
+                             % (os.path.basename(path), "×".join(str(d) for d in image.data.shape)))
+        previous = self._background_volume()
+        layer = layers.RGBLayer(image, os.path.basename(path), path)
+        del image
+        layer.previous_background = previous
+        layer.mode = "background"
+        layer.opacity = 0.6
+        self.rgb_layers.append(layer)
+        self.show_rgb(layer, fit=True)
+        self.request_views()
+        self._notify("rgbs", layer)
+        return layer
+
+    def show_rgb(self, layer, fit=False):
+        """Background: the RGB map alone. Overlay: on top of the previous background (T1, ...)."""
+        if layer.node is None:
+            return
+        if layer.mode == "overlay":
+            bg = layer.previous_background
+            if bg is not None and (bg.GetScene() is None or bg is layer.node):
+                bg = None
+            kwargs = {"foreground": layer.node, "foregroundOpacity": layer.opacity}
+            if bg is not None:
+                kwargs["background"] = bg
+            slicer.util.setSliceViewerLayers(fit=fit, **kwargs)
+        else:
+            if self._foreground_volume() is layer.node:
+                slicer.util.setSliceViewerLayers(foreground=None)
+            slicer.util.setSliceViewerLayers(background=layer.node, fit=fit)
+
+    def remove_rgb(self, layer):
+        if layer in self.rgb_layers:
+            self.rgb_layers.remove(layer)
+        layer.remove()
+        self._notify("rgbs")
+
+    def _composite(self):
+        lm = slicer.app.layoutManager()
+        names = list(lm.sliceViewNames()) if lm is not None else []
+        if not names:
+            return None
+        return lm.sliceWidget(names[0]).sliceLogic().GetSliceCompositeNode()
+
+    def _background_volume(self):
+        comp = self._composite()
+        vid = comp.GetBackgroundVolumeID() if comp is not None else None
+        return slicer.mrmlScene.GetNodeByID(vid) if vid else None
+
+    def _foreground_volume(self):
+        comp = self._composite()
+        vid = comp.GetForegroundVolumeID() if comp is not None else None
+        return slicer.mrmlScene.GetNodeByID(vid) if vid else None
+
     def load_image(self, path):
+        if mrtrix_io.looks_like_vector(path):
+            return self.load_rgb(path)
         low = path.lower()
         if low.endswith((".mif", ".mif.gz", ".mih")):
             image = mrtrix_io.read_mif(path)
