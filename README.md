@@ -25,7 +25,7 @@ Pour en faire une extension installable, le dossier `SlicerMRView` contient déj
 1. **Ouvrir des fichiers…** : sélectionne en une fois le T1, les FOD et le `.tck`. Le type est détecté automatiquement (une image 4D avec 15/28/45/66/91 volumes est traitée comme FOD, une image à 3 volumes comme carte FA couleur). Les boutons *Tractogramme / FOD / Image / FA couleur* forcent le type.
 2. Section **Tractographie** : couleur, épaisseur, tranche 2D, tubes.
 3. Section **ODF / FOD** : taille et seuil des glyphes. *Aligner les coupes sur la grille* oriente les vues selon l'image FOD (utile pour une acquisition oblique).
-4. Section **FA couleur (RVB)** : *Luminosité* (1 = le 99,5e percentile en pleine intensité), *Affichage* en image de fond ou superposée à l'image de fond précédente, *Opacité*.
+4. Section **FA couleur (RVB)** : *Visible*, *Luminosité* (1 = le 99,5e percentile en pleine intensité), *Affichage* en image de fond ou superposée à l'image de fond précédente (superposée par défaut si une image est déjà en fond), *Opacité*, *Interpolation* (à décocher pour voir les voxels comme dans mrview), *Aligner les coupes sur la grille*.
 5. Section **Filtrage par ROI** : *+ Boîte* / *+ Sphère* (vert = inclure, rouge = exclure), puis déplace les poignées dans les vues. Le rôle se change dans le tableau ; double-clic sur une ligne pour centrer les coupes sur la ROI.
 
 ### Gros tractogrammes

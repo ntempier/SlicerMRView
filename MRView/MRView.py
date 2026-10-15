@@ -440,7 +440,9 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             self.rgbRemove.setText("✕")
         self.rgbRemove.setToolTip("Fermer cette carte")
-        v.addWidget(_hbox(self.rgbCombo, self.rgbRemove))
+        self.rgbVisible = qt.QCheckBox("Visible")
+        self.rgbVisible.checked = True
+        v.addWidget(_hbox(self.rgbCombo, self.rgbVisible, self.rgbRemove))
 
         self.rgbInfo = qt.QLabel("")
         self.rgbInfo.setObjectName("mrHint")
@@ -453,7 +455,7 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         form.setFieldGrowthPolicy(qt.QFormLayout.AllNonFixedFieldsGrow)
         v.addWidget(self.rgbForm)
 
-        self.rgbGain = _slider(0.2, 5.0, 0.05, 1.0)
+        self.rgbGain = _slider(0.1, 5.0, 0.05, 1.0)
         self.rgbGain.setToolTip("Multiplie l'intensité des couleurs (1 = le 99,5e percentile est à pleine luminosité).")
         form.addRow("Luminosité", self.rgbGain)
         self.rgbMode = qt.QComboBox()
@@ -464,6 +466,13 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.rgbOpacity = _slider(0.0, 1.0, 0.05, 0.6)
         self.rgbOpacityLabel = qt.QLabel("Opacité")
         form.addRow(self.rgbOpacityLabel, self.rgbOpacity)
+        self.rgbInterpolate = qt.QCheckBox("Interpolation")
+        self.rgbInterpolate.checked = True
+        self.rgbInterpolate.setToolTip("Décocher pour voir les voxels nets, comme dans mrview.")
+        form.addRow("", self.rgbInterpolate)
+        self.rgbAlign = _button("Aligner les coupes sur la grille", "mrSoft",
+                                "Oriente les coupes 2D selon les axes de cette carte (utile si l'acquisition est oblique)")
+        form.addRow("", self.rgbAlign)
 
         self.rgbEmpty = qt.QLabel("Aucune carte chargée. Bouton « FA couleur » (ou « Ouvrir des fichiers… ») "
                                   "pour une image à 3 volumes, par ex. la sortie de tensor2metric -vector.")
@@ -478,6 +487,9 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.rgbCombo.currentIndexChanged.connect(self.on_rgb_selected)
         self.rgbRemove.clicked.connect(self.on_remove_rgb)
+        self.rgbVisible.toggled.connect(self.on_rgb_visible)
+        self.rgbInterpolate.toggled.connect(self.on_rgb_interpolate)
+        self.rgbAlign.clicked.connect(self.on_rgb_align)
         self.rgbGain.connect("valueChanged(double)", lambda x: self._syncing or self._rgb_gain_timer.start())
         self.rgbMode.currentIndexChanged.connect(self.on_rgb_mode)
         self.rgbOpacity.connect("valueChanged(double)", self.on_rgb_opacity)
@@ -508,6 +520,7 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         has = layer is not None
         self.rgbCombo.visible = has
         self.rgbRemove.visible = has
+        self.rgbVisible.visible = has
         self.rgbForm.visible = has
         self.rgbInfo.visible = has
         self.rgbEmpty.visible = not has
@@ -519,6 +532,9 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.rgbGain.value = layer.gain
             self.rgbMode.setCurrentIndex(1 if layer.mode == "overlay" else 0)
             self.rgbOpacity.value = layer.opacity
+            self.rgbVisible.checked = layer.visible
+            dn = layer.node.GetDisplayNode() if layer.node is not None else None
+            self.rgbInterpolate.checked = bool(dn.GetInterpolate()) if dn is not None else True
             self.rgbOpacity.enabled = layer.mode == "overlay"
             self.rgbOpacityLabel.enabled = layer.mode == "overlay"
         finally:
@@ -556,6 +572,28 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         layer.opacity = value
         if layer.mode == "overlay":
             self.logic.show_rgb(layer)
+
+    def on_rgb_visible(self, on):
+        layer = self.current_rgb()
+        if self._syncing or layer is None:
+            return
+        layer.visible = on
+        self.logic.show_rgb(layer)
+
+    def on_rgb_interpolate(self, on):
+        layer = self.current_rgb()
+        if self._syncing or layer is None or layer.node is None:
+            return
+        dn = layer.node.GetDisplayNode()
+        if dn is not None:
+            dn.SetInterpolate(1 if on else 0)
+
+    def on_rgb_align(self):
+        layer = self.current_rgb()
+        if layer is not None and layer.node is not None:
+            for sn in layers.slice_nodes():
+                sn.RotateToVolumePlane(layer.node)
+            self.logic.request_views()
 
     def on_remove_rgb(self):
         layer = self.current_rgb()
@@ -1390,8 +1428,9 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         layer = layers.RGBLayer(image, os.path.basename(path), path)
         del image
         layer.previous_background = previous
-        layer.mode = "background"
+        layer.mode = "overlay" if previous is not None else "background"
         layer.opacity = 0.6
+        layer.visible = True
         self.rgb_layers.append(layer)
         self.show_rgb(layer, fit=True)
         self.request_views()
@@ -1401,6 +1440,13 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     def show_rgb(self, layer, fit=False):
         """Background: the RGB map alone. Overlay: on top of the previous background (T1, ...)."""
         if layer.node is None:
+            return
+        if not layer.visible:
+            if self._foreground_volume() is layer.node:
+                slicer.util.setSliceViewerLayers(foreground=None)
+            if self._background_volume() is layer.node:
+                bg = layer.previous_background
+                slicer.util.setSliceViewerLayers(background=bg if bg is not None and bg.GetScene() is not None else None)
             return
         if layer.mode == "overlay":
             bg = layer.previous_background
