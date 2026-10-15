@@ -60,4 +60,4 @@ SlicerMRView/
 
 - Pas de rendu des pics (`peaks`), ni de fichiers `.trk` / `.tck` multiples fusionnés.
 - Les ROI masque d'une segmentation se mettent à jour quand la segmentation est modifiée, mais l'export de chaque segment peut être lent pendant l'édition.
-- Le module n'a pas encore pu être lancé dans un vrai Slicer de mon côté (pas d'accès au téléchargement) : la logique a été testée sur tes données avec une maquette de l'API Slicer.
+
