@@ -12,7 +12,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from MRViewLib import mrtrix_io as io  # noqa: E402
-from MRViewLib import sh, tracts  # noqa: E402
+from MRViewLib import bundle_fod, sh, tracts  # noqa: E402
 
 
 def _random_tractogram(n=50, seed=1):
@@ -128,6 +128,43 @@ def test_rotated_box():
     w2o = np.linalg.inv(obj_to_world)
     p = np.array([[1.2, 1.2, 0], [1.2, -1.2, 0]], np.float32)
     assert tracts.points_in_box(p, w2o, [2.0, 0.5, 0.5]).tolist() == [True, False]
+
+
+def test_densify():
+    pts = np.array([[0, 0, 0], [3, 0, 0], [3, 2, 0], [10, 10, 10]], np.float32)
+    offsets = np.array([0, 3, 4])
+    samples, sl, tan = bundle_fod.densify(pts, offsets, 1.0)
+    # 0->3 split in 3, 3->(3,2) split in 2, last point of streamline 0, then the lone point
+    assert samples.shape[0] == 3 + 2 + 1 + 1
+    assert sl.tolist() == [0, 0, 0, 0, 0, 0, 1]
+    assert np.allclose(samples[1], [1, 0, 0]) and np.allclose(samples[4], [3, 1, 0])
+    assert np.allclose(tan[0], [1, 0, 0]) and np.allclose(tan[5], [0, 1, 0])
+    gaps = np.linalg.norm(np.diff(samples[:6], axis=0), axis=1)
+    assert gaps.max() <= 1.0 + 1e-6
+
+
+def test_bundle_fod_map():
+    # 10x10x10 grid of 2 mm voxels; FOD present everywhere
+    index_map = np.arange(1000, dtype=np.int32).reshape(10, 10, 10)
+    ijk_to_ras = np.diag([2.0, 2.0, 2.0, 1.0])
+    ras_to_ijk = np.linalg.inv(ijk_to_ras)
+    # two streamlines along x through voxel row j=2,k=3 (one sparse: 6 mm steps), one along y elsewhere
+    pts = np.array([[0, 4, 6], [6, 4, 6], [12, 4, 6], [18, 4, 6],
+                    [0, 4, 6], [18, 4, 6],
+                    [14, 0, 14], [14, 18, 14]], np.float32)
+    offsets = np.array([0, 4, 6, 8])
+    m = bundle_fod.BundleFODMap(pts, offsets, index_map, ras_to_ijk, [2, 2, 2], 1000)
+    row = index_map[:, 2, 3]
+    assert np.all(m.count[row] == 2)          # densified: no voxel skipped, each streamline counted once
+    col = index_map[7, :, 7]
+    assert np.all(m.count[col] == 1)
+    assert m.n_voxels_hit == 20
+    assert np.count_nonzero(m.mask(2)) == 10
+    dirs = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [-1, 0, 0]], np.float32)
+    w = m.lobe_weights(np.array([row[4], col[4], 0]), dirs, 20.0)
+    assert np.allclose(w[0], [1, 0, 0, 1])    # along x (antipodal symmetric)
+    assert np.allclose(w[1], [0, 1, 0, 0])
+    assert np.allclose(w[2], 0)               # voxel not visited
 
 
 def test_real_data():

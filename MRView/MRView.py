@@ -12,11 +12,11 @@ from slicer.util import VTKObservationMixin
 
 import importlib
 
-from MRViewLib import mrtrix_io, sh, tracts, vtk_utils, layers
+from MRViewLib import mrtrix_io, sh, tracts, vtk_utils, bundle_fod, layers
 
 # Slicer only re-executes MRView.py on "Reload" (or after a git pull without a full
 # restart): reload the helper modules too, in dependency order, so they never go stale.
-for _mod in (mrtrix_io, sh, tracts, vtk_utils, layers):
+for _mod in (mrtrix_io, sh, tracts, vtk_utils, bundle_fod, layers):
     importlib.reload(_mod)
 del _mod
 
@@ -146,6 +146,7 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         VTKObservationMixin.__init__(self)
         self.logic = None
         self._syncing = False
+        self._swatches = {}
 
     # ------------------------------------------------------------------ setup
     def setup(self):
@@ -156,17 +157,15 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self._build_header()
         self._build_data_section()
-        self._build_tract_section()
+        self._build_bundle_section()
         self._build_fod_section()
         self._build_rgb_section()
-        self._build_roi_section()
         self._build_help_section()
         self.layout.addStretch(1)
 
-        self.refresh_tract_list()
         self.refresh_fod_list()
+        self.refresh_tract_list()
         self.refresh_rgb_list()
-        self.refresh_roi_table()
         self.refresh_filter_stats()
 
     def cleanup(self):
@@ -233,26 +232,49 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         recenter.clicked.connect(self.logic.recenter_views)
         v.addWidget(_hbox(layout_label, *buttons, None, recenter))
 
-    # -- tractography -----------------------------------------------------------
-    def _build_tract_section(self):
+    # -- bundles (tractograms, their ROIs and display) ---------------------------
+    def _build_bundle_section(self):
         box = ctk.ctkCollapsibleButton()
-        box.text = "Tractographie"
+        box.text = "Faisceaux de fibres"
         self.layout.addWidget(box)
         self.tractBox = box
         v = qt.QVBoxLayout(box)
 
-        self.tractCombo = qt.QComboBox()
-        self.tractCombo.setSizePolicy(qt.QSizePolicy.Expanding, qt.QSizePolicy.Fixed)
-        self.tractVisible = qt.QCheckBox("Visible")
-        self.tractVisible.checked = True
-        self.tractRemove = qt.QToolButton()
-        trash = _icon("SP_TrashIcon")
-        if trash is not None:
-            self.tractRemove.setIcon(trash)
-        else:
-            self.tractRemove.setText("✕")
-        self.tractRemove.setToolTip("Fermer ce tractogramme")
-        v.addWidget(_hbox(self.tractCombo, self.tractVisible, self.tractRemove))
+        hint = qt.QLabel("Chaque faisceau a ses propres ROI, sa couleur et ses réglages. "
+                         "« Nouveau faisceau » repart des mêmes fibres pour isoler un autre faisceau.")
+        hint.setObjectName("mrHint")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        self.bundleTable = qt.QTableWidget()
+        self.bundleTable.setColumnCount(5)
+        self.bundleTable.setHorizontalHeaderLabels(["", "Faisceau", "Fibres", "Visible", ""])
+        self.bundleTable.verticalHeader().setVisible(False)
+        self.bundleTable.setSelectionMode(qt.QAbstractItemView.SingleSelection)
+        self.bundleTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
+        hh = self.bundleTable.horizontalHeader()
+        hh.setSectionResizeMode(0, qt.QHeaderView.Fixed)
+        hh.setSectionResizeMode(1, qt.QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, qt.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, qt.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, qt.QHeaderView.ResizeToContents)
+        self.bundleTable.setColumnWidth(0, 30)
+        self.bundleTable.setMinimumHeight(110)
+        self.bundleTable.setMaximumHeight(190)
+        self.bundleTable.setToolTip("Clique sur un faisceau pour régler ses ROI et son affichage. "
+                                    "Double-clic sur le nom pour le renommer.")
+        self.bundleTable.connect("currentCellChanged(int,int,int,int)", self.on_bundle_row_changed)
+        self.bundleTable.itemChanged.connect(self.on_bundle_item_changed)
+        v.addWidget(self.bundleTable)
+
+        self.newBundleButton = _button("+ Nouveau faisceau", "mrPrimary",
+                                       "Nouveau faisceau à partir des mêmes fibres, sans ROI, avec sa propre couleur.\n"
+                                       "Ajoute-lui ensuite des ROI pour isoler un autre faisceau.")
+        self.dupBundleButton = _button("Dupliquer", "mrSoft",
+                                       "Copie le faisceau sélectionné avec ses ROI, pour en faire une variante.")
+        self.newBundleButton.clicked.connect(lambda: self.on_new_bundle(copy_rois=False))
+        self.dupBundleButton.clicked.connect(lambda: self.on_new_bundle(copy_rois=True))
+        v.addWidget(_hbox(self.newBundleButton, self.dupBundleButton))
 
         self.tractStats = qt.QLabel("Aucun tractogramme chargé.")
         self.tractStats.setObjectName("mrHint")
@@ -260,11 +282,24 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.tractStats.setTextFormat(qt.Qt.RichText)
         v.addWidget(self.tractStats)
 
+        self.bundleTabs = qt.QTabWidget()
+        self.bundleTabs.setObjectName("mrTabs")
+        roi_page = qt.QWidget()
+        self.roiPage = roi_page
+        self._build_roi_page(qt.QVBoxLayout(roi_page))
+        display_page = qt.QWidget()
+        self._build_display_page(qt.QVBoxLayout(display_page))
+        self.bundleTabs.addTab(roi_page, "ROI du faisceau")
+        self.bundleTabs.addTab(display_page, "Affichage")
+        v.addWidget(self.bundleTabs)
+
+    def _build_display_page(self, v):
         self.tractForm = qt.QWidget()
         form = qt.QFormLayout(self.tractForm)
         form.setContentsMargins(0, 4, 0, 0)
         form.setFieldGrowthPolicy(qt.QFormLayout.AllNonFixedFieldsGrow)
         v.addWidget(self.tractForm)
+        v.addStretch(1)
 
         self.colorModeCombo = qt.QComboBox()
         for key, label in COLOR_MODES:
@@ -320,11 +355,8 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                                        "L'export .tck utilise toujours le tractogramme complet.")
         form.addRow("Fibres affichées (max)", self.maxDisplaySpin)
 
-        self.tractCombo.currentIndexChanged.connect(self.on_tract_selected)
-        self.tractVisible.toggled.connect(lambda on: self._set_tract("visible", on))
-        self.tractRemove.clicked.connect(self.on_remove_tract)
         self.colorModeCombo.currentIndexChanged.connect(self.on_color_mode)
-        self.solidColorButton.connect("colorChanged(QColor)", lambda c: self._set_tract("solid_color", _rgb(c)))
+        self.solidColorButton.connect("colorChanged(QColor)", self.on_solid_color)
         self.colormapCombo.connect("currentNodeChanged(vtkMRMLNode*)", self.on_colormap)
         self.scalarRange.connect("valuesChanged(double,double)", lambda a, b: self._set_tract("scalar_range", (a, b)))
         self.tsfButton.clicked.connect(self.on_load_tsf)
@@ -340,10 +372,113 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if default_cmap is not None:
             self.colormapCombo.setCurrentNode(default_cmap)
 
+    def _build_roi_page(self, v):
+        hint = qt.QLabel("Ces ROI ne filtrent que le faisceau sélectionné. Ajoute une ROI puis déplace-la "
+                         "avec ses poignées dans les vues : les fibres se mettent à jour en direct.")
+        hint.setObjectName("mrHint")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        self.addBoxInclude = _button("+ Boîte", "mrInclude", "Nouvelle ROI boîte (inclure)")
+        self.addSphereInclude = _button("+ Sphère", "mrInclude", "Nouvelle ROI sphère (inclure)")
+        self.addBoxExclude = _button("+ Boîte", "mrExclude", "Nouvelle ROI boîte (exclure)")
+        self.addSphereExclude = _button("+ Sphère", "mrExclude", "Nouvelle ROI sphère (exclure)")
+        grid = qt.QGridLayout()
+        grid.addWidget(qt.QLabel("Inclure"), 0, 0)
+        grid.addWidget(self.addBoxInclude, 0, 1)
+        grid.addWidget(self.addSphereInclude, 0, 2)
+        grid.addWidget(qt.QLabel("Exclure"), 1, 0)
+        grid.addWidget(self.addBoxExclude, 1, 1)
+        grid.addWidget(self.addSphereExclude, 1, 2)
+        v.addLayout(grid)
+        self.addBoxInclude.clicked.connect(lambda: self.on_add_roi("box", "include"))
+        self.addSphereInclude.clicked.connect(lambda: self.on_add_roi("sphere", "include"))
+        self.addBoxExclude.clicked.connect(lambda: self.on_add_roi("box", "exclude"))
+        self.addSphereExclude.clicked.connect(lambda: self.on_add_roi("sphere", "exclude"))
+
+        self.maskSelector = slicer.qMRMLNodeComboBox()
+        self.maskSelector.nodeTypes = ["vtkMRMLSegmentationNode", "vtkMRMLLabelMapVolumeNode", "vtkMRMLScalarVolumeNode"]
+        self.maskSelector.noneEnabled = True
+        self.maskSelector.addEnabled = False
+        self.maskSelector.removeEnabled = False
+        self.maskSelector.showChildNodeTypes = True
+        self.maskSelector.setMRMLScene(slicer.mrmlScene)
+        self.maskSelector.setToolTip("Segmentation (une ROI par segment), labelmap ou volume binaire")
+        self.addMaskButton = _button("+ Masque", "mrSoft", "Ajouter ce masque / ces segments comme ROI de ce faisceau")
+        self.addMaskButton.clicked.connect(self.on_add_mask)
+        v.addWidget(_hbox(self.maskSelector, self.addMaskButton))
+
+        self.roiTable = qt.QTableWidget()
+        self.roiTable.setColumnCount(5)
+        self.roiTable.setHorizontalHeaderLabels(["", "Nom", "Rôle", "Actif", ""])
+        self.roiTable.verticalHeader().setVisible(False)
+        self.roiTable.setSelectionMode(qt.QAbstractItemView.SingleSelection)
+        self.roiTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
+        hh = self.roiTable.horizontalHeader()
+        hh.setSectionResizeMode(0, qt.QHeaderView.Fixed)
+        hh.setSectionResizeMode(1, qt.QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, qt.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, qt.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, qt.QHeaderView.ResizeToContents)
+        self.roiTable.setColumnWidth(0, 14)
+        self.roiTable.setMinimumHeight(110)
+        self.roiTable.cellDoubleClicked.connect(lambda r, c: self.logic.jump_to_roi(r))
+        self.roiTable.itemChanged.connect(self.on_roi_item_changed)
+        v.addWidget(self.roiTable)
+
+        self.includeAll = qt.QRadioButton("toutes (ET)")
+        self.includeAny = qt.QRadioButton("au moins une (OU)")
+        self.includeAll.checked = True
+        self.includeAll.toggled.connect(self.on_include_mode)
+        v.addWidget(_hbox(qt.QLabel("Inclusions requises :"), self.includeAll, self.includeAny, None))
+
+        self.liveCheck = qt.QCheckBox("Filtrage en direct")
+        self.liveCheck.checked = True
+        self.applyButton = _button("Appliquer", "mrSoft")
+        self.applyButton.enabled = False
+        self.showRois = qt.QCheckBox("Afficher les ROI")
+        self.showRois.checked = True
+        self.showRois.setToolTip("Seules les ROI du faisceau sélectionné sont affichées dans les vues.")
+        self.liveCheck.toggled.connect(self.on_live_toggled)
+        self.applyButton.clicked.connect(self.logic.apply_filters)
+        self.showRois.toggled.connect(self.logic.set_rois_visible)
+        v.addWidget(_hbox(self.liveCheck, self.applyButton, None, self.showRois))
+
+        self.ratioBar = qt.QProgressBar()
+        self.ratioBar.setObjectName("mrRatio")
+        self.ratioBar.setRange(0, 1000)
+        self.ratioBar.setValue(1000)
+        self.ratioBar.setFormat("—")
+        v.addWidget(self.ratioBar)
+        self.filterStats = qt.QLabel("")
+        self.filterStats.setObjectName("mrHint")
+        self.filterStats.setWordWrap(True)
+        self.filterStats.setTextFormat(qt.Qt.RichText)
+        v.addWidget(self.filterStats)
+
+        self.bundleFodButton = _button("Voir les FOD de ce faisceau", "mrSoft",
+                                       "N'affiche que les FOD des voxels traversés par les fibres sélectionnées de ce faisceau "
+                                       "(réglages dans la section ODF / FOD).")
+        self.bundleFodButton.clicked.connect(self.on_show_bundle_fod)
+        v.addWidget(self.bundleFodButton)
+
+        self.exportButton = _button("Enregistrer la sélection (.tck)…", "mrPrimary",
+                                    "Applique les ROI de ce faisceau au tractogramme complet et enregistre le résultat",
+                                    _icon("SP_DialogSaveButton"))
+        self.toLayerButton = _button("Figer en tractogramme", "mrSoft",
+                                     "Crée un nouveau tractogramme indépendant à partir des fibres sélectionnées")
+        self.clearRoisButton = _button("Supprimer les ROI", "mrSoft", "Supprime toutes les ROI de ce faisceau")
+        self.exportButton.clicked.connect(self.on_export_selection)
+        self.toLayerButton.clicked.connect(self.on_selection_to_layer)
+        self.clearRoisButton.clicked.connect(self.on_clear_rois)
+        v.addWidget(self.exportButton)
+        v.addWidget(_hbox(self.toLayerButton, self.clearRoisButton))
+
     # -- FOD --------------------------------------------------------------------
     def _build_fod_section(self):
         box = ctk.ctkCollapsibleButton()
         box.text = "ODF / FOD"
+        self.fodBox = box
         self.layout.addWidget(box)
         v = qt.QVBoxLayout(box)
 
@@ -399,6 +534,40 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         form.addRow("Couleur", _hbox(self.fodColorMode, self.fodColor))
         self.fodOpacity = _slider(0.0, 1.0, 0.05, 1.0)
         form.addRow("Opacité", self.fodOpacity)
+
+        # -- FOD of a bundle -----------------------------------------------------
+        self.fodBundleBox = qt.QGroupBox("FOD d'un faisceau")
+        self.fodBundleBox.setToolTip("Ne montre que les FOD utilisées par un faisceau : celles des voxels "
+                                     "traversés par ses fibres sélectionnées (mises à jour quand ses ROI bougent).")
+        bform = qt.QFormLayout(self.fodBundleBox)
+        bform.setFieldGrowthPolicy(qt.QFormLayout.AllNonFixedFieldsGrow)
+        self.fodBundleCombo = qt.QComboBox()
+        self.fodBundleCombo.setToolTip("Faisceau dont on veut voir les FOD")
+        bform.addRow("Faisceau", self.fodBundleCombo)
+        self.fodBundleMin = qt.QSpinBox()
+        self.fodBundleMin.setRange(1, 100000)
+        self.fodBundleMin.setValue(1)
+        self.fodBundleMin.setSuffix(" fibre(s)")
+        self.fodBundleMin.setToolTip("Nombre minimum de fibres du faisceau qui doivent traverser un voxel pour afficher sa FOD.")
+        bform.addRow("Min. par voxel", self.fodBundleMin)
+        self.fodBundleLobes = qt.QCheckBox("Seulement les lobes alignés sur les fibres")
+        self.fodBundleLobes.setToolTip("Dans chaque voxel, ne garde que les lobes de la FOD orientés comme les fibres "
+                                       "du faisceau qui le traversent.")
+        bform.addRow("", self.fodBundleLobes)
+        self.fodBundleAngle = _slider(5.0, 60.0, 1.0, 25.0, 0, "°")
+        self.fodBundleAngle.setToolTip("Écart angulaire toléré entre un lobe et la direction des fibres.")
+        self.fodBundleAngleLabel = qt.QLabel("Tolérance")
+        bform.addRow(self.fodBundleAngleLabel, self.fodBundleAngle)
+        self.fodBundleInfo = qt.QLabel("")
+        self.fodBundleInfo.setObjectName("mrHint")
+        self.fodBundleInfo.setWordWrap(True)
+        bform.addRow(self.fodBundleInfo)
+        v.addWidget(self.fodBundleBox)
+
+        self.fodBundleCombo.currentIndexChanged.connect(self.on_fod_bundle)
+        self.fodBundleMin.valueChanged.connect(lambda x: self._set_fod("bundle_min", int(x)))
+        self.fodBundleLobes.toggled.connect(self.on_fod_bundle_lobes)
+        self.fodBundleAngle.connect("valueChanged(double)", lambda x: self._set_fod("bundle_angle", x))
 
         self.alignButton = _button("Aligner les coupes sur la grille", "mrSoft",
                                    "Oriente les coupes 2D selon les axes de l'image FOD (utile si l'acquisition est oblique)")
@@ -600,109 +769,6 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if layer is not None:
             self.logic.remove_rgb(layer)
 
-    # -- ROI --------------------------------------------------------------------
-    def _build_roi_section(self):
-        box = ctk.ctkCollapsibleButton()
-        box.text = "Filtrage par ROI (en direct)"
-        self.layout.addWidget(box)
-        v = qt.QVBoxLayout(box)
-
-        hint = qt.QLabel("Ajoute une ROI puis déplace-la ou redimensionne-la avec ses poignées "
-                         "dans les vues : les fibres se mettent à jour en direct.")
-        hint.setObjectName("mrHint")
-        hint.setWordWrap(True)
-        v.addWidget(hint)
-
-        self.addBoxInclude = _button("+ Boîte", "mrInclude", "Nouvelle ROI boîte (inclure)")
-        self.addSphereInclude = _button("+ Sphère", "mrInclude", "Nouvelle ROI sphère (inclure)")
-        self.addBoxExclude = _button("+ Boîte", "mrExclude", "Nouvelle ROI boîte (exclure)")
-        self.addSphereExclude = _button("+ Sphère", "mrExclude", "Nouvelle ROI sphère (exclure)")
-        incl_label = qt.QLabel("Inclure")
-        excl_label = qt.QLabel("Exclure")
-        grid = qt.QGridLayout()
-        grid.addWidget(incl_label, 0, 0)
-        grid.addWidget(self.addBoxInclude, 0, 1)
-        grid.addWidget(self.addSphereInclude, 0, 2)
-        grid.addWidget(excl_label, 1, 0)
-        grid.addWidget(self.addBoxExclude, 1, 1)
-        grid.addWidget(self.addSphereExclude, 1, 2)
-        v.addLayout(grid)
-        self.addBoxInclude.clicked.connect(lambda: self.logic.add_roi("box", "include"))
-        self.addSphereInclude.clicked.connect(lambda: self.logic.add_roi("sphere", "include"))
-        self.addBoxExclude.clicked.connect(lambda: self.logic.add_roi("box", "exclude"))
-        self.addSphereExclude.clicked.connect(lambda: self.logic.add_roi("sphere", "exclude"))
-
-        self.maskSelector = slicer.qMRMLNodeComboBox()
-        self.maskSelector.nodeTypes = ["vtkMRMLSegmentationNode", "vtkMRMLLabelMapVolumeNode", "vtkMRMLScalarVolumeNode"]
-        self.maskSelector.noneEnabled = True
-        self.maskSelector.addEnabled = False
-        self.maskSelector.removeEnabled = False
-        self.maskSelector.showChildNodeTypes = True
-        self.maskSelector.setMRMLScene(slicer.mrmlScene)
-        self.maskSelector.setToolTip("Segmentation (un ROI par segment), labelmap ou volume binaire")
-        self.addMaskButton = _button("+ Masque", "mrSoft", "Ajouter ce masque / ces segments comme ROI")
-        self.addMaskButton.clicked.connect(self.on_add_mask)
-        v.addWidget(_hbox(self.maskSelector, self.addMaskButton))
-
-        self.roiTable = qt.QTableWidget()
-        self.roiTable.setColumnCount(5)
-        self.roiTable.setHorizontalHeaderLabels(["", "Nom", "Rôle", "Actif", ""])
-        self.roiTable.verticalHeader().setVisible(False)
-        self.roiTable.setSelectionMode(qt.QAbstractItemView.SingleSelection)
-        self.roiTable.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
-        hh = self.roiTable.horizontalHeader()
-        hh.setSectionResizeMode(0, qt.QHeaderView.Fixed)
-        hh.setSectionResizeMode(1, qt.QHeaderView.Stretch)
-        hh.setSectionResizeMode(2, qt.QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(3, qt.QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(4, qt.QHeaderView.ResizeToContents)
-        self.roiTable.setColumnWidth(0, 14)
-        self.roiTable.setMinimumHeight(130)
-        self.roiTable.cellDoubleClicked.connect(lambda r, c: self.logic.jump_to_roi(r))
-        self.roiTable.itemChanged.connect(self.on_roi_item_changed)
-        v.addWidget(self.roiTable)
-
-        self.includeAll = qt.QRadioButton("toutes (ET)")
-        self.includeAny = qt.QRadioButton("au moins une (OU)")
-        self.includeAll.checked = True
-        self.includeAll.toggled.connect(lambda on: self.logic.set_include_mode("all" if on else "any"))
-        v.addWidget(_hbox(qt.QLabel("Inclusions requises :"), self.includeAll, self.includeAny, None))
-
-        self.liveCheck = qt.QCheckBox("Filtrage en direct")
-        self.liveCheck.checked = True
-        self.applyButton = _button("Appliquer", "mrSoft")
-        self.applyButton.enabled = False
-        self.showRois = qt.QCheckBox("Afficher les ROI")
-        self.showRois.checked = True
-        self.liveCheck.toggled.connect(self.on_live_toggled)
-        self.applyButton.clicked.connect(self.logic.apply_filters)
-        self.showRois.toggled.connect(self.logic.set_rois_visible)
-        v.addWidget(_hbox(self.liveCheck, self.applyButton, None, self.showRois))
-
-        self.ratioBar = qt.QProgressBar()
-        self.ratioBar.setObjectName("mrRatio")
-        self.ratioBar.setRange(0, 1000)
-        self.ratioBar.setValue(1000)
-        self.ratioBar.setFormat("—")
-        v.addWidget(self.ratioBar)
-        self.filterStats = qt.QLabel("")
-        self.filterStats.setObjectName("mrHint")
-        self.filterStats.setWordWrap(True)
-        self.filterStats.setTextFormat(qt.Qt.RichText)
-        v.addWidget(self.filterStats)
-
-        self.exportButton = _button("Enregistrer la sélection (.tck)…", "mrPrimary",
-                                    "Applique les ROI au tractogramme complet et enregistre le résultat",
-                                    _icon("SP_DialogSaveButton"))
-        self.toLayerButton = _button("Nouveau tractogramme", "mrSoft",
-                                     "Crée un nouveau tractogramme à partir des fibres sélectionnées")
-        self.clearRoisButton = _button("Supprimer les ROI", "mrSoft")
-        self.exportButton.clicked.connect(self.on_export_selection)
-        self.toLayerButton.clicked.connect(self.on_selection_to_layer)
-        self.clearRoisButton.clicked.connect(self.on_clear_rois)
-        v.addWidget(self.exportButton)
-        v.addWidget(_hbox(self.toLayerButton, self.clearRoisButton))
-
     def _build_help_section(self):
         box = ctk.ctkCollapsibleButton()
         box.text = "Astuces"
@@ -713,6 +779,11 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             "<ul style='margin-left:-20px'>"
             "<li><b>Défilement des coupes</b> : molette ou flèches ↑/↓ dans une vue 2D.</li>"
             "<li><b>Déplacer le curseur 3D</b> : Maj + déplacement de la souris.</li>"
+            "<li><b>Plusieurs faisceaux</b> : charge un tractogramme, puis « + Nouveau faisceau » pour chaque faisceau "
+            "à isoler. Chacun a ses ROI (seules celles du faisceau sélectionné sont affichées) et sa couleur "
+            "(clic sur la pastille de couleur).</li>"
+            "<li><b>FOD d'un faisceau</b> : « Voir les FOD de ce faisceau » (onglet ROI) ne montre que les FOD des voxels "
+            "traversés par ses fibres ; option pour ne garder que les lobes alignés sur les fibres.</li>"
             "<li><b>ROI</b> : double-clic sur une ligne du tableau pour centrer les coupes dessus.</li>"
             "<li><b>Gros tractogrammes</b> : réduis « Fibres affichées (max) » pour garder un filtrage fluide ; "
             "l'export utilise toujours toutes les fibres.</li>"
@@ -787,34 +858,136 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _remember_dir(self, path):
         qt.QSettings().setValue("MRView/lastDir", os.path.dirname(path))
 
-    # ---------------------------------------------------------- tract actions
+    # --------------------------------------------------------- bundle actions
     def current_tract(self):
-        i = self.tractCombo.currentIndex
+        i = self.bundleTable.currentRow()
         if 0 <= i < len(self.logic.tract_layers):
             return self.logic.tract_layers[i]
         return None
 
     def refresh_tract_list(self, select=None):
+        """Rebuild the bundle table (call when bundles are added, removed or recoloured)."""
         self._syncing = True
         try:
             current = select if select is not None else self.current_tract()
-            self.tractCombo.clear()
-            for layer in self.logic.tract_layers:
-                self.tractCombo.addItem(layer.name)
-            if current in self.logic.tract_layers:
-                self.tractCombo.setCurrentIndex(self.logic.tract_layers.index(current))
-            elif self.logic.tract_layers:
-                self.tractCombo.setCurrentIndex(len(self.logic.tract_layers) - 1)
+            bundles = self.logic.tract_layers
+            self._swatches = {}
+            self.bundleTable.setRowCount(len(bundles))
+            for row, layer in enumerate(bundles):
+                swatch = qt.QToolButton()
+                swatch.setAutoRaise(False)
+                swatch.setFixedSize(22, 18)
+                swatch.setCursor(qt.QCursor(qt.Qt.PointingHandCursor))
+                swatch.setStyleSheet(_swatch_style(layer))
+                swatch.setToolTip("Couleur du faisceau : clic pour choisir une couleur unie")
+                swatch.clicked.connect(lambda checked=False, l=layer: self.on_pick_bundle_color(l))
+                self._swatches[layer.uid] = swatch
+                self.bundleTable.setCellWidget(row, 0, _centered(swatch))
+
+                name = qt.QTableWidgetItem(layer.name)
+                name.setToolTip(layer.path or layer.name)
+                name.setFlags(qt.Qt.ItemIsEnabled | qt.Qt.ItemIsSelectable | qt.Qt.ItemIsEditable)
+                self.bundleTable.setItem(row, 1, name)
+
+                count = qt.QTableWidgetItem(_count_text(layer))
+                count.setFlags(qt.Qt.ItemIsEnabled | qt.Qt.ItemIsSelectable)
+                count.setTextAlignment(qt.Qt.AlignRight | qt.Qt.AlignVCenter)
+                self.bundleTable.setItem(row, 2, count)
+
+                visible = qt.QCheckBox()
+                visible.checked = layer.visible
+                visible.setToolTip("Afficher ce faisceau")
+                visible.toggled.connect(lambda on, l=layer: self.on_bundle_visible(l, on))
+                self.bundleTable.setCellWidget(row, 3, _centered(visible))
+
+                delete = qt.QToolButton()
+                trash = _icon("SP_TrashIcon")
+                if trash is not None:
+                    delete.setIcon(trash)
+                else:
+                    delete.setText("✕")
+                delete.setAutoRaise(True)
+                delete.setToolTip("Fermer ce faisceau (et ses ROI)")
+                delete.clicked.connect(lambda checked=False, l=layer: self.on_remove_tract(l))
+                self.bundleTable.setCellWidget(row, 4, _centered(delete))
+            if current in bundles:
+                self.bundleTable.setCurrentCell(bundles.index(current), 1)
+            elif bundles:
+                self.bundleTable.setCurrentCell(len(bundles) - 1, 1)
         finally:
             self._syncing = False
+        self.logic.set_active_bundle(self.current_tract())
         self.sync_tract_controls()
+        self.refresh_roi_table()
+        self.refresh_fod_bundle_combo()
+
+    def refresh_bundle_counts(self):
+        self._syncing = True
+        try:
+            for row, layer in enumerate(self.logic.tract_layers):
+                item = self.bundleTable.item(row, 2)
+                if item is not None:
+                    item.setText(_count_text(layer))
+        finally:
+            self._syncing = False
+
+    def refresh_bundle_swatch(self, layer):
+        swatch = self._swatches.get(layer.uid) if layer is not None else None
+        if swatch is not None:
+            swatch.setStyleSheet(_swatch_style(layer))
+
+    def on_bundle_row_changed(self, row, col, prev_row, prev_col):
+        if self._syncing or row == prev_row:
+            return
+        self.logic.set_active_bundle(self.current_tract())
+        self.sync_tract_controls()
+        self.refresh_roi_table()
+        self.refresh_filter_stats()
+
+    def on_bundle_item_changed(self, item):
+        if self._syncing or item.column() != 1:
+            return
+        row = item.row()
+        if 0 <= row < len(self.logic.tract_layers):
+            name = item.text().strip()
+            if name:
+                self.logic.tract_layers[row].rename(name)
+                self.refresh_fod_bundle_combo()
+                self.sync_fod_controls()
+
+    def on_bundle_visible(self, layer, on):
+        layer.visible = on
+        layer.apply_display()
+        layer.invalidate_slabs()
+        self.logic.request_views()
+
+    def on_pick_bundle_color(self, layer):
+        color = qt.QColorDialog.getColor(_qcolor(layer.solid_color), slicer.util.mainWindow(),
+                                         "Couleur de « %s »" % layer.name)
+        if not color.isValid():
+            return
+        layer.solid_color = _rgb(color)
+        layer.color_mode = "solid"
+        layer.apply_display()
+        self.refresh_bundle_swatch(layer)
+        if layer is self.current_tract():
+            self.sync_tract_controls()
+
+    def on_new_bundle(self, copy_rois=False):
+        source = self.current_tract()
+        if source is None:
+            slicer.util.warningDisplay("Charge d'abord un tractogramme (bouton « Tractogramme »).")
+            return
+        with slicer.util.tryWithErrorDisplay("Impossible de créer le faisceau", waitCursor=True):
+            self.logic.new_bundle(source, copy_rois=copy_rois)
+            self.bundleTabs.setCurrentIndex(0)
 
     def sync_tract_controls(self):
         layer = self.current_tract()
         has = layer is not None
-        self.tractForm.enabled = has
-        self.tractVisible.enabled = has
-        self.tractRemove.enabled = has
+        for w in (self.tractForm, self.roiPage, self.dupBundleButton, self.newBundleButton):
+            if w is not None:
+                w.enabled = has
         if not has:
             self.tractStats.text = "Aucun tractogramme chargé. Utilise « Ouvrir des fichiers… »."
             self._update_color_rows("direction")
@@ -822,7 +995,6 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._syncing = True
         try:
             self.tractStats.text = layer.stats_text()
-            self.tractVisible.checked = layer.visible
             self.colorModeCombo.setCurrentIndex([k for k, _ in COLOR_MODES].index(layer.color_mode))
             self.solidColorButton.color = _qcolor(layer.solid_color)
             if layer.colormap_id:
@@ -834,6 +1006,8 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.tractShow2D.checked = layer.show2d
             self.slabSlider.value = layer.slab_mm
             self.maxDisplaySpin.setValue(layer.max_display)
+            self.includeAll.checked = layer.include_mode == "all"
+            self.includeAny.checked = layer.include_mode == "any"
             self._sync_scalar_range(layer)
             self._update_color_rows(layer.color_mode)
         finally:
@@ -864,11 +1038,6 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         for w in (self.tsfButton, self.tsfLabel):
             w.setVisible(mode == "tsf")
 
-    def on_tract_selected(self, index):
-        if not self._syncing:
-            self.sync_tract_controls()
-            self.refresh_filter_stats()
-
     def _set_tract(self, attr, value):
         if self._syncing:
             return
@@ -885,6 +1054,12 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.request_views()
         else:
             layer.apply_display()
+
+    def on_solid_color(self, color):
+        if self._syncing:
+            return
+        self._set_tract("solid_color", _rgb(color))
+        self.refresh_bundle_swatch(self.current_tract())
 
     def _select_color_mode(self, mode):
         keys = [k for k, _ in COLOR_MODES]
@@ -913,6 +1088,7 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             layer.colormap_id = self.colormapCombo.currentNodeID
         with _WaitCursor():
             layer.apply_display()
+        self.refresh_bundle_swatch(layer)
         self._syncing = True
         self._sync_scalar_range(layer)
         self._syncing = False
@@ -942,6 +1118,7 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 layer.colormap_id = self.colormapCombo.currentNodeID
             layer.apply_display()
             self.sync_tract_controls()
+            self.refresh_bundle_swatch(layer)
 
     def on_max_display(self, value):
         if self._syncing:
@@ -953,10 +1130,14 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.set_max_display(layer, int(value))
         self.sync_tract_controls()
 
-    def on_remove_tract(self):
-        layer = self.current_tract()
-        if layer is not None:
-            self.logic.remove_tract(layer)
+    def on_remove_tract(self, layer=None):
+        layer = layer or self.current_tract()
+        if layer is None:
+            return
+        if layer.rois and not slicer.util.confirmYesNoDisplay(
+                "Fermer « %s » et supprimer ses %d ROI ?" % (layer.name, len(layer.rois))):
+            return
+        self.logic.remove_tract(layer)
 
     # ------------------------------------------------------------ FOD actions
     def current_fod(self):
@@ -983,11 +1164,12 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def sync_fod_controls(self):
         layer = self.current_fod()
         has = layer is not None
-        for w in (self.fodForm, self.fodVisible, self.fodRemove, self.alignButton, self.l0Button):
+        for w in (self.fodForm, self.fodVisible, self.fodRemove, self.alignButton, self.l0Button, self.fodBundleBox):
             w.enabled = has
         if not has:
             self.fodInfo.text = "Aucune image FOD chargée."
             self.fodCount.text = ""
+            self.refresh_fod_bundle_combo()
             return
         self._syncing = True
         try:
@@ -1002,8 +1184,12 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.fodColorMode.setCurrentIndex(0 if layer.color_mode == "direction" else 1)
             self.fodColor.color = _qcolor(layer.solid_color)
             self.fodOpacity.value = layer.opacity
+            self.fodBundleMin.setValue(layer.bundle_min)
+            self.fodBundleLobes.checked = layer.bundle_lobes
+            self.fodBundleAngle.value = layer.bundle_angle
         finally:
             self._syncing = False
+        self.refresh_fod_bundle_combo()
         self.refresh_fod_count()
 
     def refresh_fod_count(self):
@@ -1013,6 +1199,8 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
         total = sum(layer.glyph_counts.values())
         self.fodCount.text = "%s glyphes affichés" % layers._fmt_int(total)
+        if layer.bundle is not None:
+            self.fodBundleInfo.text = layer.bundle_text()
 
     def on_fod_selected(self, index):
         if not self._syncing:
@@ -1047,19 +1235,97 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if layer is not None and layer.l0_node is not None:
             slicer.util.setSliceViewerLayers(background=layer.l0_node)
 
+    # ---------------------------------------------------- FOD of a bundle
+    def refresh_fod_bundle_combo(self):
+        self._syncing = True
+        try:
+            self.fodBundleCombo.clear()
+            self.fodBundleCombo.addItem("Aucun (toutes les FOD)")
+            for layer in self.logic.tract_layers:
+                self.fodBundleCombo.addItem(layer.name)
+            fod = self.current_fod()
+            index = 0
+            if fod is not None and fod.bundle in self.logic.tract_layers:
+                index = self.logic.tract_layers.index(fod.bundle) + 1
+            self.fodBundleCombo.setCurrentIndex(index)
+        finally:
+            self._syncing = False
+        self._sync_fod_bundle_rows()
+
+    def _sync_fod_bundle_rows(self):
+        fod = self.current_fod()
+        active = fod is not None and fod.bundle is not None
+        self.fodBundleMin.enabled = active
+        self.fodBundleLobes.enabled = active
+        lobes = active and fod.bundle_lobes
+        self.fodBundleAngle.enabled = lobes
+        self.fodBundleAngleLabel.enabled = lobes
+        self.fodBundleInfo.text = fod.bundle_text() if active else ""
+        self.fodBundleInfo.visible = active
+
+    def on_fod_bundle(self, index):
+        if self._syncing:
+            return
+        fod = self.current_fod()
+        if fod is None:
+            return
+        layer = self.logic.tract_layers[index - 1] if 0 < index <= len(self.logic.tract_layers) else None
+        with _WaitCursor():
+            self.logic.set_fod_bundle(fod, layer)
+        self._sync_fod_bundle_rows()
+
+    def on_fod_bundle_lobes(self, on):
+        self._set_fod("bundle_lobes", on)
+        self._sync_fod_bundle_rows()
+
+    def on_show_bundle_fod(self):
+        layer = self.current_tract()
+        if layer is None:
+            return
+        fod = self.current_fod()
+        if fod is None:
+            slicer.util.warningDisplay("Charge d'abord une image FOD (bouton « FOD »).")
+            return
+        with _WaitCursor():
+            fod.visible = True
+            fod.apply_display()
+            self.logic.set_fod_bundle(fod, layer)
+        self.sync_fod_controls()
+        self.fodBox.collapsed = False
+
     # ------------------------------------------------------------ ROI actions
+    def current_rois(self):
+        layer = self.current_tract()
+        return layer.rois if layer is not None else []
+
+    def on_add_roi(self, shape, mode):
+        if self.current_tract() is None:
+            slicer.util.warningDisplay("Charge d'abord un tractogramme : les ROI appartiennent à un faisceau.")
+            return
+        self.logic.add_roi(shape, mode, layer=self.current_tract())
+
     def on_add_mask(self):
         node = self.maskSelector.currentNode()
         if node is None:
             slicer.util.warningDisplay("Choisis d'abord une segmentation, une labelmap ou un volume.")
             return
+        if self.current_tract() is None:
+            slicer.util.warningDisplay("Charge d'abord un tractogramme : les ROI appartiennent à un faisceau.")
+            return
         with slicer.util.tryWithErrorDisplay("Impossible d'utiliser ce masque", waitCursor=True):
-            self.logic.add_mask_roi(node)
+            self.logic.add_mask_roi(node, layer=self.current_tract())
+
+    def on_include_mode(self, all_on):
+        if self._syncing:
+            return
+        layer = self.current_tract()
+        if layer is not None:
+            self.logic.set_include_mode(layer, "all" if all_on else "any")
 
     def refresh_roi_table(self):
         self._syncing = True
         try:
-            entries = self.logic.rois
+            entries = self.current_rois()
             self.roiTable.setRowCount(len(entries))
             for row, e in enumerate(entries):
                 swatch = qt.QTableWidgetItem("")
@@ -1114,9 +1380,10 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def on_roi_item_changed(self, item):
         if self._syncing or item.column() != 1:
             return
+        rois = self.current_rois()
         row = item.row()
-        if 0 <= row < len(self.logic.rois):
-            e = self.logic.rois[row]
+        if 0 <= row < len(rois):
+            e = rois[row]
             if e.shape != "mask":
                 e.node.SetName(item.text())
 
@@ -1127,13 +1394,14 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.request_filter()
 
     def refresh_filter_stats(self):
+        self.refresh_bundle_counts()
         layer = self.current_tract()
-        n_rois = len([e for e in self.logic.rois if e.enabled])
         if layer is None:
             self.ratioBar.setValue(0)
             self.ratioBar.setFormat("Aucun tractogramme")
             self.filterStats.text = ""
             return
+        n_rois = len([e for e in layer.rois if e.enabled])
         total = layer.n_displayed_total
         sel = layer.n_selected
         frac = sel / float(total) if total else 0.0
@@ -1141,7 +1409,7 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ratioBar.setFormat("%s / %s fibres  (%.1f %%)" % (layers._fmt_int(sel), layers._fmt_int(total), 100 * frac))
         parts = []
         if n_rois == 0:
-            parts.append("Aucune ROI active : toutes les fibres sont affichées.")
+            parts.append("Aucune ROI active pour ce faisceau : toutes ses fibres sont affichées.")
         if layer.is_subsampled:
             parts.append("Compté sur le sous-échantillon affiché (%s / %s fibres)."
                          % (layers._fmt_int(layer.ws.n_streamlines), layers._fmt_int(layer.full.n_streamlines)))
@@ -1173,14 +1441,17 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.selection_to_layer(layer)
 
     def on_clear_rois(self):
-        if self.logic.rois and slicer.util.confirmYesNoDisplay("Supprimer toutes les ROI ?"):
-            self.logic.clear_rois()
+        layer = self.current_tract()
+        if layer is not None and layer.rois and slicer.util.confirmYesNoDisplay(
+                "Supprimer toutes les ROI de « %s » ?" % layer.name):
+            self.logic.clear_rois(layer)
 
     # ------------------------------------------------------------ logic events
     def _on_logic_event(self, event, payload=None):
         if event == "tracts":
             self.refresh_tract_list(select=payload)
             self.refresh_filter_stats()
+            self.sync_fod_controls()
         elif event == "fods":
             self.refresh_fod_list(select=payload)
         elif event == "rgbs":
@@ -1190,8 +1461,28 @@ class MRViewWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.refresh_filter_stats()
         elif event == "filtered":
             self.refresh_filter_stats()
+        elif event == "fod-bundle":
+            self._sync_fod_bundle_rows()
         elif event == "views":
             self.refresh_fod_count()
+
+
+def _count_text(layer):
+    total = layer.n_displayed_total
+    sel = layer.n_selected
+    if sel == total:
+        return layers._fmt_int(total)
+    return "%s / %s" % (layers._fmt_int(sel), layers._fmt_int(total))
+
+
+def _swatch_style(layer):
+    if layer.color_mode == "solid":
+        r, g, b = [int(round(255 * c)) for c in layer.solid_color]
+        bg = "rgb(%d,%d,%d)" % (r, g, b)
+    else:
+        # colour depends on the fibre (direction, scalar...): show a direction-like gradient
+        bg = "qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #e74c3c, stop:0.5 #2ecc71, stop:1 #3498db)"
+    return "QToolButton { background: %s; border: 1px solid rgba(0,0,0,0.35); border-radius: 4px; }" % bg
 
 
 class _WaitCursor(object):
@@ -1226,8 +1517,10 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self.tract_layers = []
         self.fod_layers = []
         self.rgb_layers = []
-        self.rois = []
-        self.include_mode = "all"
+        self.active_bundle = None  # bundle whose ROIs are being edited (and shown)
+        self._bundle_counter = 1
+        self._roi_counter = {}
+        self._changed_bundles = set()
         self.live = True
         self.rois_visible = True
         self.last_filter_ms = None
@@ -1243,6 +1536,11 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         self._filter_timer.setSingleShot(True)
         self._filter_timer.setInterval(5)
         self._filter_timer.connect("timeout()", self.apply_filters)
+        # FODs filtered by a bundle follow its ROIs, throttled so dragging stays fluid
+        self._fod_bundle_timer = qt.QTimer()
+        self._fod_bundle_timer.setSingleShot(True)
+        self._fod_bundle_timer.setInterval(120)
+        self._fod_bundle_timer.connect("timeout()", self._update_fod_bundles)
 
         self._observe_slice_nodes()
         self.addObserver(slicer.mrmlScene, slicer.mrmlScene.NodeAddedEvent, self._on_node_added)
@@ -1252,6 +1550,7 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     def cleanup(self):
         self._view_timer.stop()
         self._filter_timer.stop()
+        self._fod_bundle_timer.stop()
         self.removeObservers()
 
     # -- listeners ---------------------------------------------------------------
@@ -1282,7 +1581,7 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     def _on_node_removed(self, caller, event, node):
         if node is None:
             return
-        for e in list(self.rois):
+        for e in self.all_rois():
             if e.node is node:
                 self._drop_roi(e, remove_node=False)
                 self._notify("rois")
@@ -1298,12 +1597,13 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
                 self._notify("rgbs")
 
     def _on_scene_closing(self, caller=None, event=None):
+        for e in self.all_rois():
+            self._unobserve_roi(e)
         self.tract_layers = []
         self.fod_layers = []
         self.rgb_layers = []
-        for e in self.rois:
-            self._unobserve_roi(e)
-        self.rois = []
+        self.active_bundle = None
+        self._changed_bundles = set()
         self._notify("tracts")
         self._notify("fods")
         self._notify("rgbs")
@@ -1354,12 +1654,13 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     def add_tractogram(self, tractogram, name, path=None, max_display=150000):
         first = not self.tract_layers and not self.fod_layers
         layer = layers.TractLayer(tractogram, name, path, max_display=max_display)
+        layer.solid_color = self.next_bundle_color()
         cmap = slicer.mrmlScene.GetNodeByID("vtkMRMLColorTableNodeFileViridis.txt")
         layer.colormap_id = cmap.GetID() if cmap is not None else None
         self.tract_layers.append(layer)
         qt.QTimer.singleShot(0, layer.apply_tubes)
-        if self.rois:
-            self.apply_filters()
+        self.active_bundle = layer
+        self._update_roi_visibility()
         self.request_views()
         if first:
             self._center_on_tracts(layer)
@@ -1499,8 +1800,7 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     def set_max_display(self, layer, value):
         layer.set_max_display(value)
-        if self.rois:
-            self.apply_filters()
+        self.apply_filters()
         layer.invalidate_slabs()
         self.request_views()
         self._notify("filtered")
@@ -1508,7 +1808,17 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     def remove_tract(self, layer):
         if layer in self.tract_layers:
             self.tract_layers.remove(layer)
+        for e in list(layer.rois):
+            self._drop_roi(e, remove_node=True)
+        if self.active_bundle is layer:
+            self.active_bundle = None
+        for fod in self.fod_layers:
+            if fod.bundle is layer:
+                fod.bundle = None
+                fod.bundle_map = None
+                fod.invalidate()
         layer.remove()
+        self.request_views()
         self._notify("tracts")
 
     def remove_fod(self, layer):
@@ -1517,39 +1827,161 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         layer.remove()
         self._notify("fods")
 
+    # -- bundles ---------------------------------------------------------------------
+    def next_bundle_color(self):
+        used = set(tuple(l.solid_color) for l in self.tract_layers)
+        for c in layers.BUNDLE_COLORS:
+            if tuple(c) not in used:
+                return c
+        return layers.BUNDLE_COLORS[len(self.tract_layers) % len(layers.BUNDLE_COLORS)]
+
+    def new_bundle(self, source, copy_rois=False, name=None):
+        """A new bundle on the same streamlines as `source`, with its own ROIs and colour.
+
+        copy_rois: also copy the ROIs of `source` (new, independent ROI nodes)."""
+        self._bundle_counter += 1
+        if name is None:
+            name = ("%s (copie)" % source.name) if copy_rois else "Faisceau %d" % self._bundle_counter
+        layer = layers.TractLayer(source.full, name, source.path, max_display=source.max_display)
+        layer.colormap_id = source.colormap_id
+        layer.full_tsf, layer.tsf_name = source.full_tsf, source.tsf_name
+        layer.solid_color = self.next_bundle_color()
+        layer.color_mode = "solid"
+        layer.line_width = source.line_width
+        layer.tubes = source.tubes
+        layer.slab_mm = source.slab_mm
+        layer.include_mode = source.include_mode if copy_rois else "all"
+        layer.apply_display()
+        self.tract_layers.append(layer)
+        qt.QTimer.singleShot(0, layer.apply_tubes)
+        if copy_rois:
+            for e in source.rois:
+                self._copy_roi(e, layer)
+        self.active_bundle = layer
+        self._update_roi_visibility()
+        self.apply_filters()
+        self.request_views()
+        self._notify("tracts", layer)
+        return layer
+
+    def set_active_bundle(self, layer):
+        """The bundle being edited: only its ROIs are shown in the views."""
+        if layer is self.active_bundle:
+            return
+        self.active_bundle = layer
+        self._update_roi_visibility()
+
+    def set_fod_bundle(self, fod, layer):
+        fod.bundle = layer
+        fod.compute_bundle_map()
+        fod.invalidate()
+        self.request_views()
+        self._notify("fods", fod)
+
+    def _request_fod_bundles(self, changed):
+        if any(f.bundle in changed for f in self.fod_layers):
+            self._changed_bundles.update(changed)
+            if not self._fod_bundle_timer.isActive():
+                self._fod_bundle_timer.start()
+
+    def _update_fod_bundles(self):
+        changed, self._changed_bundles = self._changed_bundles, set()
+        updated = False
+        for fod in self.fod_layers:
+            if fod.bundle is not None and fod.bundle in changed:
+                try:
+                    fod.compute_bundle_map()
+                    updated = True
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+        if updated:
+            self.request_views()
+            self._notify("fod-bundle")
+
     # -- ROIs ------------------------------------------------------------------------
-    def _default_roi_center(self):
+    def all_rois(self):
+        return [e for layer in self.tract_layers for e in layer.rois]
+
+    def _owner(self, entry):
+        for layer in self.tract_layers:
+            if entry in layer.rois:
+                return layer
+        return None
+
+    def _roi_should_show(self, entry):
+        return self.rois_visible and entry.enabled and self._owner(entry) is self.active_bundle
+
+    def _update_roi_visibility(self):
+        for e in self.all_rois():
+            e.set_visible(self._roi_should_show(e))
+
+    def _default_roi_center(self, layer=None):
         center = layers.slice_intersection_point()
-        if self.tract_layers:
-            pts = self.tract_layers[0].ws.points
+        layer = layer or (self.tract_layers[0] if self.tract_layers else None)
+        if layer is not None:
+            pts = layer.ws.points
             if pts.shape[0]:
                 lo, hi = pts.min(0), pts.max(0)
                 if center is None or np.any(center < lo - 5) or np.any(center > hi + 5):
                     center = np.median(pts[:: max(1, pts.shape[0] // 50000)], axis=0)
         return center if center is not None else np.zeros(3)
 
-    def add_roi(self, shape, mode="include", center=None, size=None):
-        count = sum(1 for e in self.rois if e.shape == shape) + 1
+    def add_roi(self, shape, mode="include", center=None, size=None, layer=None):
+        layer = layer or self.active_bundle or (self.tract_layers[-1] if self.tract_layers else None)
+        if layer is None:
+            raise ValueError("Charge d'abord un tractogramme : les ROI appartiennent à un faisceau.")
+        self._roi_counter[shape] = self._roi_counter.get(shape, 0) + 1
         prefix = {"box": "Boîte", "sphere": "Sphère"}[shape]
-        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", "%s %d" % (prefix, count))
+        node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsROINode", "%s %d" % (prefix, self._roi_counter[shape]))
         node.CreateDefaultDisplayNodes()
-        center = self._default_roi_center() if center is None else np.asarray(center, float)
-        size = size or (10.0 if shape == "box" else 8.0)
+        center = self._default_roi_center(layer) if center is None else np.asarray(center, float)
+        size = size if size is not None else (10.0 if shape == "box" else 8.0)
+        size = [float(size)] * 3 if np.isscalar(size) else [float(x) for x in size]
         node.SetCenter([float(x) for x in center])
-        node.SetSize([float(size)] * 3)
+        node.SetSize(size)
         node.SetAttribute("MRView.Shape", shape)
         layers.put_in_folder(node)
         entry = layers.ROIEntry(node, shape, mode)
+        layer.rois.append(entry)
         entry.apply_color()
         entry.update_sphere_model()
-        entry.set_visible(self.rois_visible)
+        entry.set_visible(self._roi_should_show(entry))
         self._observe_roi(entry)
-        self.rois.append(entry)
         self._notify("rois")
         self.apply_filters()
         return entry
 
-    def add_mask_roi(self, node, mode="include"):
+    def _copy_roi(self, entry, layer):
+        if entry.shape == "mask":
+            new = layers.ROIEntry(entry.node, "mask", entry.mode, segment_id=entry.segment_id)
+            new.load_mask()
+            new.enabled = entry.enabled
+            layer.rois.append(new)
+            new.apply_color()
+            self._observe_roi(new)
+            return new
+        c = [0.0, 0.0, 0.0]
+        entry.node.GetCenter(c)
+        new = self.add_roi(entry.shape, entry.mode, center=c, size=list(entry.node.GetSize()), layer=layer)
+        try:
+            m = vtk.vtkMatrix4x4()
+            m.DeepCopy(entry.node.GetObjectToNodeMatrix())
+            new.node.SetAndObserveObjectToNodeMatrix(m)
+            new.node.SetCenter(c)
+        except Exception:
+            pass
+        if entry.node.GetParentTransformNode() is not None:
+            new.node.SetAndObserveTransformNodeID(entry.node.GetParentTransformNode().GetID())
+        new.update_sphere_model()
+        new.enabled = entry.enabled
+        new.set_visible(self._roi_should_show(new))
+        return new
+
+    def add_mask_roi(self, node, mode="include", layer=None):
+        layer = layer or self.active_bundle or (self.tract_layers[-1] if self.tract_layers else None)
+        if layer is None:
+            raise ValueError("Charge d'abord un tractogramme : les ROI appartiennent à un faisceau.")
         added = []
         if node.IsA("vtkMRMLSegmentationNode"):
             seg = node.GetSegmentation()
@@ -1567,7 +1999,7 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         for entry in added:
             entry.apply_color()
             self._observe_roi(entry)
-            self.rois.append(entry)
+            layer.rois.append(entry)
         self._notify("rois")
         self.apply_filters()
         return added
@@ -1623,45 +2055,50 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     def set_roi_enabled(self, entry, enabled):
         entry.enabled = enabled
-        entry.set_visible(enabled and self.rois_visible)
+        entry.set_visible(self._roi_should_show(entry))
         self.apply_filters()
 
     def set_rois_visible(self, visible):
         self.rois_visible = visible
-        for e in self.rois:
-            e.set_visible(visible and e.enabled)
+        self._update_roi_visibility()
 
-    def set_include_mode(self, mode):
-        self.include_mode = mode
+    def set_include_mode(self, layer, mode):
+        layer.include_mode = mode
         self.apply_filters()
 
     def _drop_roi(self, entry, remove_node=True):
         self._unobserve_roi(entry)
-        if entry in self.rois:
-            self.rois.remove(entry)
-        entry.remove(remove_node=remove_node)
         for layer in self.tract_layers:
+            if entry in layer.rois:
+                layer.rois.remove(entry)
             for key in [k for k in layer.roi_cache if k[0] == entry.uid]:
                 del layer.roi_cache[key]
+        entry.remove(remove_node=remove_node)
 
     def remove_roi(self, entry):
         if isinstance(entry, int):
-            entry = self.rois[entry]
+            rois = self.active_bundle.rois if self.active_bundle is not None else []
+            if not (0 <= entry < len(rois)):
+                return
+            entry = rois[entry]
         self._drop_roi(entry, remove_node=True)
         self._notify("rois")
         self.apply_filters()
 
-    def clear_rois(self):
-        for e in list(self.rois):
-            self._drop_roi(e, remove_node=True)
+    def clear_rois(self, layer=None):
+        targets = [layer] if layer is not None else list(self.tract_layers)
+        for l in targets:
+            for e in list(l.rois):
+                self._drop_roi(e, remove_node=True)
         self._notify("rois")
         self.apply_filters()
 
     def jump_to_roi(self, entry):
         if isinstance(entry, int):
-            if not (0 <= entry < len(self.rois)):
+            rois = self.active_bundle.rois if self.active_bundle is not None else []
+            if not (0 <= entry < len(rois)):
                 return
-            entry = self.rois[entry]
+            entry = rois[entry]
         if entry.shape == "mask":
             mask, A = entry._mask, entry._ras_to_ijk
             if mask is None:
@@ -1686,11 +2123,12 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
             self._filter_timer.start()
 
     def apply_filters(self):
+        """Each bundle is filtered by its own ROIs."""
         t0 = time.time()
-        entries = [e for e in self.rois if e.enabled]
+        changed = set()
         for layer in self.tract_layers:
             incl, excl = [], []
-            for e in entries:
+            for e in [e for e in layer.rois if e.enabled]:
                 key = (e.uid, e.mode == "endpoints")
                 try:
                     sig = e.signature()
@@ -1703,18 +2141,19 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
                 else:
                     hits = cached[1]
                 (excl if e.mode == "exclude" else incl).append(hits)
-            sel = tracts.combine_selection(layer.ws.n_streamlines, incl, excl, self.include_mode)
+            sel = tracts.combine_selection(layer.ws.n_streamlines, incl, excl, layer.include_mode)
             if layer.set_selection(sel):
                 layer.invalidate_slabs()
+                changed.add(layer)
         self.last_filter_ms = 1000.0 * (time.time() - t0)
         # update 2D slabs right away so 2D and 3D stay in sync while dragging
         self._all_views_dirty = True
         self._process_views()
+        self._request_fod_bundles(changed)
         self._notify("filtered")
 
     def full_selection(self, layer):
-        entries = [e for e in self.rois if e.enabled]
-        return layer.selection_for_full(entries, self.include_mode)
+        return layer.selection_for_full()
 
     def export_selection(self, layer, path):
         sel = self.full_selection(layer)
@@ -1731,6 +2170,7 @@ class MRViewLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
         new.color_mode = layer.color_mode
         new.solid_color = layer.solid_color
         new.apply_display()
+        self._notify("tracts", new)
         return new
 
 
