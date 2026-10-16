@@ -5,8 +5,10 @@ Module Python (scripted module) pour 3D Slicer 5.x qui reproduit les fonctions p
 - **Tractogrammes `.tck`** en 3D et dans les coupes 2D, avec une coupe épaisse réglable (« crop to slab » de mrview).
 - **Couleurs** : direction locale, direction des extrémités, couleur unie, aléatoire par fibre, longueur, scalaires `.tsf` (avec palette et plage réglables), opacité, épaisseur, rendu en tubes ombrés calculés par la carte graphique.
 - **FOD / ODF** (`.mif`, `.mif.gz`, `.nii`, `.nii.gz`, convention SH de MRtrix3) en glyphes colorés par direction dans les coupes 2D et en 3D : taille, seuil, niveau de détail, normalisation, couleur unie. Le terme l=0 est chargé comme image de fond.
-- **Filtrage en direct par ROI** : boîtes et sphères déplaçables à la souris, masques (labelmap, volume binaire, segments d'une segmentation). Rôles : *Inclure*, *Exclure*, *Extrémités*. Inclusions combinées en ET ou en OU.
-- **Export** de la sélection en `.tck` (calculé sur le tractogramme complet) ou création d'un nouveau tractogramme.
+- **Plusieurs faisceaux filtrés séparément** : chaque faisceau a ses propres ROI, sa couleur et ses réglages. « + Nouveau faisceau » repart des mêmes fibres (par exemple un tractogramme du cerveau entier) pour isoler un autre faisceau ; « Dupliquer » copie un faisceau avec ses ROI.
+- **Filtrage en direct par ROI** : boîtes et sphères déplaçables à la souris, masques (labelmap, volume binaire, segments d'une segmentation). Rôles : *Inclure*, *Exclure*, *Extrémités*. Inclusions combinées en ET ou en OU, pour chaque faisceau.
+- **FOD d'un faisceau** : n'affiche que les FOD des voxels traversés par les fibres sélectionnées d'un faisceau (nombre minimum de fibres par voxel réglable), avec en option uniquement les lobes alignés sur les fibres. L'affichage suit les ROI du faisceau en direct.
+- **Export** de la sélection en `.tck` (calculé sur le tractogramme complet) ou « Figer en tractogramme » (nouveau tractogramme indépendant).
 - **FA couleur (RVB)** : les cartes de vecteurs à 3 volumes (par ex. `tensor2metric -vector`, `.mif` ou NIfTI) s'affichent en couleurs comme dans mrview (|x| rouge, |y| vert, |z| bleu), en image de fond ou superposées au T1, avec luminosité et opacité réglables.
 - Images anatomiques `.mif` / NIfTI.
 
@@ -23,20 +25,23 @@ Pour en faire une extension installable, le dossier `SlicerMRView` contient déj
 ## Utilisation rapide
 
 1. **Ouvrir des fichiers…** : sélectionne en une fois le T1, les FOD et le `.tck`. Le type est détecté automatiquement (une image 4D avec 15/28/45/66/91 volumes est traitée comme FOD, une image à 3 volumes comme carte FA couleur). Les boutons *Tractogramme / FOD / Image / FA couleur* forcent le type.
-2. Section **Tractographie** : couleur, épaisseur, tranche 2D, tubes.
+2. Section **Faisceaux de fibres** : le tableau liste les faisceaux (pastille de couleur cliquable, nom modifiable par double-clic, fibres sélectionnées / total, visibilité). Sélectionne un faisceau pour régler :
+   - l'onglet **ROI du faisceau** : *+ Boîte* / *+ Sphère* (vert = inclure, rouge = exclure), puis déplace les poignées dans les vues. Seules les ROI du faisceau sélectionné sont affichées et elles ne filtrent que lui. Le rôle se change dans le tableau ; double-clic sur une ligne pour centrer les coupes sur la ROI. *Voir les FOD de ce faisceau* active le filtrage des FOD par ce faisceau ;
+   - l'onglet **Affichage** : couleur, épaisseur, tranche 2D, tubes.
 3. Section **ODF / FOD** : taille et seuil des glyphes. *Aligner les coupes sur la grille* oriente les vues selon l'image FOD (utile pour une acquisition oblique).
-4. Section **FA couleur (RVB)** : *Visible*, *Luminosité* (1 = le 99,5e percentile en pleine intensité), *Affichage* en image de fond ou superposée à l'image de fond précédente (superposée par défaut si une image est déjà en fond), *Opacité*, *Interpolation* (à décocher pour voir les voxels comme dans mrview), *Aligner les coupes sur la grille*.
-5. Section **Filtrage par ROI** : *+ Boîte* / *+ Sphère* (vert = inclure, rouge = exclure), puis déplace les poignées dans les vues. Le rôle se change dans le tableau ; double-clic sur une ligne pour centrer les coupes sur la ROI.
+4. Section **ODF / FOD → FOD d'un faisceau** : choix du faisceau (ou *Aucun*), nombre minimum de fibres par voxel, *Seulement les lobes alignés sur les fibres* et la tolérance angulaire.
+5. Section **FA couleur (RVB)** : *Visible*, *Luminosité* (1 = le 99,5e percentile en pleine intensité), *Affichage* en image de fond ou superposée à l'image de fond précédente (superposée par défaut si une image est déjà en fond), *Opacité*, *Interpolation* (à décocher pour voir les voxels comme dans mrview), *Aligner les coupes sur la grille*.
 
 ### Gros tractogrammes
 
-Le réglage **Fibres affichées (max)** (150 000 par défaut) limite l'affichage et le filtrage en direct à un sous-échantillon aléatoire. L'export `.tck` et « Nouveau tractogramme » utilisent toujours **toutes** les fibres.
+Le réglage **Fibres affichées (max)** (150 000 par défaut) limite l'affichage et le filtrage en direct à un sous-échantillon aléatoire. L'export `.tck` et « Figer en tractogramme » utilisent toujours **toutes** les fibres.
 
 ## Détails techniques
 
 - Coordonnées : les `.tck` sont en RAS scanner (mm), comme le monde de Slicer, donc aucun recalage n'est fait. Les transformations parentes de Slicer ne sont pas prises en compte dans cette version.
 - SH : base orthonormée réelle de MRtrix3 (avec la phase de Condon-Shortley), directions en espace scanner. Vérifié sur les données de test : l'amplitude des FOD le long des fibres est maximale avec cette convention.
 - Les glyphes ne sont calculés que pour les voxels de la coupe visible (et dans le champ de vue), avec réduction automatique du détail au-delà de 2,5 millions de sommets.
+- FOD d'un faisceau : les fibres sélectionnées sont rééchantillonnées tous les ½ voxel pour ne sauter aucun voxel, puis chaque voxel compte les fibres qui le traversent. En mode lobes, les directions des fibres de chaque voxel sont quantifiées (162 directions) et l'amplitude de la FOD est conservée à moins de la tolérance angulaire de l'une d'elles (fondu sur 10° de plus). Au-delà de 1,5 million de points, le calcul se fait sur un sous-échantillon de fibres.
 - Code testable hors Slicer : `python Testing/test_core.py` (numpy seul) depuis `SlicerMRView/MRView`.
 
 ## Fichiers
@@ -50,6 +55,7 @@ SlicerMRView/
       mrtrix_io.py            lecture/écriture .tck .tsf .mif .nii
       sh.py                   harmoniques sphériques, maillage des glyphes
       tracts.py               opérations vectorisées sur les fibres, tests ROI
+      bundle_fod.py           voxels et orientations d'un faisceau sur la grille des FOD
       layers.py               nœuds MRML : tractogrammes, FOD, ROI
       vtk_utils.py            conversions numpy ↔ VTK
     Testing/test_core.py      tests unitaires

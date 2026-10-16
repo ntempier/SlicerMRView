@@ -10,7 +10,7 @@ import numpy as np
 import slicer
 import vtk
 
-from . import mrtrix_io, sh, tracts, vtk_utils
+from . import bundle_fod, mrtrix_io, sh, tracts, vtk_utils
 
 POINT_DATA = vtk.vtkAssignAttribute.POINT_DATA
 
@@ -30,6 +30,12 @@ ROI_MODE_COLORS = {
     "exclude": (0.92, 0.30, 0.25),
     "endpoints": (0.98, 0.75, 0.10),
 }
+
+# Distinct colours given to the bundles in turn
+BUNDLE_COLORS = [
+    (0.98, 0.75, 0.15), (0.30, 0.70, 1.00), (1.00, 0.45, 0.70), (0.45, 0.90, 0.45),
+    (0.75, 0.55, 1.00), (1.00, 0.55, 0.25), (0.25, 0.90, 0.85), (0.95, 0.95, 0.45),
+]
 
 _uid = itertools.count(1)
 
@@ -267,6 +273,9 @@ class TractLayer(object):
         self.slab_mm = 5.0
         self.full_tsf = None
         self.tsf_name = None
+        # each bundle has its own ROIs, combined with its own rule
+        self.rois = []
+        self.include_mode = "all"
 
         self.model3d = None
         self.slab_models = {}  # slice node id -> model
@@ -557,8 +566,16 @@ class TractLayer(object):
             txt += "<br><span style='color:#d68910'>Affichage d'un sous-échantillon de %s fibres</span>" % _fmt_int(self.ws.n_streamlines)
         return txt
 
-    def selection_for_full(self, roi_entries, include_mode):
+    def rename(self, name):
+        self.name = name
+        if self.model3d is not None and self.model3d.GetScene() is not None:
+            self.model3d.SetName(name)
+
+    def selection_for_full(self, roi_entries=None, include_mode=None):
         """Apply the ROI filters to the full tractogram (used for export)."""
+        if roi_entries is None:
+            roi_entries = [e for e in self.rois if e.enabled]
+        include_mode = include_mode or self.include_mode
         incl, excl = [], []
         for e in roi_entries:
             hits = tracts.streamline_hits(self.full, e.point_test(), endpoints_only=(e.mode == "endpoints"))
@@ -593,6 +610,9 @@ class FODLayer(object):
         c0 = np.asarray(data[..., 0])
         mask = np.isfinite(c0) & (c0 > 0)
         ijk = np.argwhere(mask)
+        self.index_map = np.full(mask.shape, -1, dtype=np.int32)
+        self.index_map[mask] = np.arange(ijk.shape[0], dtype=np.int32)
+        self.ras_to_ijk = np.linalg.inv(np.asarray(image.ijk_to_ras, dtype=np.float64))
         self.coefs = np.ascontiguousarray(data[mask], dtype=np.float32)
         self.centers = (ijk @ self.ijk_to_ras[:3, :3].T + self.ijk_to_ras[:3, 3]).astype(np.float32)
         self.templates = {}
@@ -619,6 +639,12 @@ class FODLayer(object):
         self.models = {}  # slice node id -> model
         self.signatures = {}
         self.glyph_counts = {}
+        # "FOD of a bundle": only the voxels (and optionally lobes) used by a bundle
+        self.bundle = None          # TractLayer or None
+        self.bundle_lobes = False   # keep only the lobes aligned with the bundle's fibres
+        self.bundle_angle = 25.0    # degrees
+        self.bundle_min = 1         # minimum number of streamlines per voxel
+        self.bundle_map = None      # bundle_fod.BundleFODMap of the bundle's current selection
 
         self.l0_node = add_volume_from_image(_Wrap(c0, image.ijk_to_ras), "%s (l=0)" % name, show=False)
         put_in_folder(self.l0_node)
@@ -685,6 +711,31 @@ class FODLayer(object):
     def invalidate(self):
         self.signatures = {}
 
+    def compute_bundle_map(self):
+        """(Re)compute the bundle occupancy from the bundle's selected streamlines."""
+        layer = self.bundle
+        if layer is None:
+            self.bundle_map = None
+            return
+        ws = layer.ws
+        if layer.selection.all():
+            pts, offs = ws.points, ws.offsets
+        else:
+            sub = ws.subset(np.flatnonzero(layer.selection))
+            pts, offs = sub.points, sub.offsets
+        self.bundle_map = bundle_fod.BundleFODMap(pts, offs, self.index_map, self.ras_to_ijk,
+                                                  self.spacing, self.coefs.shape[0])
+        self.invalidate()
+
+    def bundle_text(self):
+        if self.bundle is None or self.bundle_map is None:
+            return ""
+        n = int(np.count_nonzero(self.bundle_map.mask(self.bundle_min)))
+        txt = "%s voxels traversés par « %s »" % (_fmt_int(n), self.bundle.name)
+        if self.bundle_map.subsampled:
+            txt += " (calculé sur un sous-échantillon de fibres)"
+        return txt
+
     def update_view(self, slice_node, force=False):
         if not (self.visible and (self.show2d or self.show3d)):
             for m in self.models.values():
@@ -704,6 +755,8 @@ class FODLayer(object):
         rel = self.centers - origin.astype(np.float32)
         d = rel @ n.astype(np.float32)
         sel = (d >= -half) & (d < half)
+        if self.bundle is not None and self.bundle_map is not None:
+            sel &= self.bundle_map.mask(self.bundle_min)
         # cull glyphs outside the visible part of the slice view
         try:
             u0, u1, v0, v1 = slice_view_bounds(slice_node)
@@ -730,6 +783,11 @@ class FODLayer(object):
         peak = amps.max(1)
         keep = peak > self.threshold * self.ref
         idx, amps, peak = idx[keep], amps[keep], peak[keep]
+        if idx.size and self.bundle is not None and self.bundle_map is not None and self.bundle_lobes:
+            amps = np.maximum(amps, 0.0) * self.bundle_map.lobe_weights(idx, tpl.dirs32, self.bundle_angle)
+            peak = amps.max(1)
+            keep = peak > 0.02 * self.ref
+            idx, amps, peak = idx[keep], amps[keep], peak[keep]
         self.glyph_counts[sid] = int(idx.size)
         if idx.size == 0:
             self._set_empty(model)
